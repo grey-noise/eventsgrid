@@ -16,6 +16,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	pb "github.com/tixu/events-web-receivers-grpc/events"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 )
 
 var msgSent = make(chan counter)
@@ -59,12 +60,12 @@ func (e *eventServer) ListFeatures(a *pb.Acknowledge, stream pb.EventsSender_Lis
 	log.Println("looking for event : ", eventID)
 	if eventID == "" {
 		log.Println("got no event to subscribe")
-		return fmt.Errorf("event can not be empty ")
+		return grpc.Errorf(codes.InvalidArgument, "event can not be empty ")
 
 	}
 	if !e.checkEvent(eventID) {
 		log.Println("event unknown to subscribe")
-		return fmt.Errorf("eventid %s is unknown ", eventID)
+		return grpc.Errorf(codes.InvalidArgument, "eventid %s is unknown ", eventID)
 	}
 
 	clientID := a.Header.GetClientId()
@@ -84,7 +85,7 @@ func (e *eventServer) ListFeatures(a *pb.Acknowledge, stream pb.EventsSender_Lis
 	sc, err := stan.Connect(e.clusterID, clientID, stan.NatsURL(e.natsEP))
 	if err != nil {
 		log.Printf("Can't connect: %v.\nMake sure a NATS Streaming Server is running at: %s", err, e.natsEP)
-		return fmt.Errorf("Can't connect: %v.\nMake sure a NATS Streaming Server is running at: %s", err, e.natsEP)
+		return grpc.Errorf(codes.Internal, "Can't connect: %v.\nMake sure a NATS Streaming Server is running at: %s", err, e.natsEP)
 	}
 
 	messages := make(chan *pb.Event)
@@ -101,7 +102,7 @@ func (e *eventServer) ListFeatures(a *pb.Acknowledge, stream pb.EventsSender_Lis
 	// Wait for a SIGINT (perhaps triggered by user with CTRL-C)
 	// Run cleanup when signal is received
 	if err != nil {
-		return fmt.Errorf("unable to create subcription %v", err)
+		return grpc.Errorf(codes.Internal, "unable to create subcription %v", err)
 	}
 	log.Printf("subsribed  to queue %s with group %ss starting at %d", eventID, groupID, a.GetCursor().GetId())
 	ctx := stream.Context()
@@ -135,6 +136,7 @@ func newServer() *eventServer {
 	clusterID := getEnv("CLUSTER-ID", "test-cluster")
 	//eventID = getEnv("EVENT-ID", "ae1db066-2153-11e8-b467-0ed5f89f718b")
 	consulEndpoint := getEnv("CONSUL-URL", "open-faas.cloud.smals.be:8500")
+	monitoring := getEnv("MONITORING-URL", "localhost:8000")
 	return &eventServer{natsEP: natsEndpoint, clusterID: clusterID, consulEP: consulEndpoint}
 
 }
