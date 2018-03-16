@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+option java_multiple_files = true;
+option java_package = "io.grpc.examples.routeguide";
+option java_outer_classname = "RouteGuideProto";
+
+package routeguide;
+
+// Interface exported by the server.
+service EventsSender {
+    rpc ListFeatures(Acknowledge) returns (stream Event) {}
+  
+}  
+message Cursor {
+    uint64 id = 1;
+    int64 ts =2;
+}
+
+message Header {
+    string clientId =   1;
+    string groupId  =   2;
+    string eventTypeId = 3;
+    string eventid =4;
+    string source = 5;
+}
+
+message Event {
+    Cursor cursor = 1;
+    Header header = 2;
+    bytes payload = 3;
+  }
+
+message Acknowledge {
+    Cursor cursor = 1;
+    Header header = 2;
+}
