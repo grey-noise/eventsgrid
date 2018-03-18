@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"math/rand"
 	"net"
@@ -27,9 +26,11 @@ type counter struct {
 }
 
 type eventServer struct {
-	natsEP    string
-	clusterID string
-	consulEP  string
+	natsEP       string
+	clusterID    string
+	consulEP     string
+	monitoringEP string
+	address      string
 }
 
 func (e *eventServer) checkEvent(eventID string) bool {
@@ -55,7 +56,7 @@ func (e *eventServer) checkEvent(eventID string) bool {
 
 // ListFeatures implements
 
-func (e *eventServer) ListFeatures(a *pb.Acknowledge, stream pb.EventsSender_ListFeaturesServer) error {
+func (e *eventServer) GetEvents(a *pb.Acknowledge, stream pb.EventsSender_GetEventsServer) error {
 	eventID := a.Header.GetEventid()
 	log.Println("looking for event : ", eventID)
 	if eventID == "" {
@@ -134,10 +135,10 @@ func (e *eventServer) ListFeatures(a *pb.Acknowledge, stream pb.EventsSender_Lis
 func newServer() *eventServer {
 	natsEndpoint := getEnv("NATS-URL", "nats://open-faas.cloud.smals.be:4223")
 	clusterID := getEnv("CLUSTER-ID", "test-cluster")
-	//eventID = getEnv("EVENT-ID", "ae1db066-2153-11e8-b467-0ed5f89f718b")
-	consulEndpoint := getEnv("CONSUL-URL", "open-faas.cloud.smals.be:8500")
+	consulEndpoint := getEnv("CONSUL-URL", "consul-ea.cloud.smals.be")
 	monitoring := getEnv("MONITORING-URL", "localhost:8000")
-	return &eventServer{natsEP: natsEndpoint, clusterID: clusterID, consulEP: consulEndpoint}
+	address := getEnv("URL", "localhost:8080")
+	return &eventServer{natsEP: natsEndpoint, clusterID: clusterID, consulEP: consulEndpoint, monitoringEP: monitoring, address: address}
 
 }
 func main() {
@@ -158,8 +159,9 @@ func main() {
 			msgCounter.WithLabelValues(m.clientID, m.groupID).Inc()
 		}
 	}()
+	s := newServer()
 	var opts []grpc.ServerOption
-	lis, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", 8080))
+	lis, err := net.Listen("tcp", s.address)
 	if err != nil {
 		log.Printf("error is %s", err)
 		panic(err)
@@ -167,11 +169,11 @@ func main() {
 	opts = append(opts, grpc.StreamInterceptor(prom.StreamServerInterceptor))
 	opts = append(opts, grpc.UnaryInterceptor(prom.UnaryServerInterceptor))
 	grpcServer := grpc.NewServer(opts...)
-	pb.RegisterEventsSenderServer(grpcServer, newServer())
+	pb.RegisterEventsSenderServer(grpcServer, s)
 	prom.Register(grpcServer)
 
 	http.Handle("/metrics", prometheus.Handler())
-	h := &http.Server{Addr: ":8000"}
+	h := &http.Server{Addr: s.monitoringEP}
 	go func() {
 		if err := h.ListenAndServe(); err != nil {
 			log.Fatal(err)

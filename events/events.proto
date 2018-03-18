@@ -4,11 +4,11 @@ option java_multiple_files = true;
 option java_package = "io.grpc.examples.routeguide";
 option java_outer_classname = "RouteGuideProto";
 
-package routeguide;
+package events;
 
 // Interface exported by the server.
 service EventsSender {
-    rpc ListFeatures(Acknowledge) returns (stream Event) {}
+    rpc getEvents(Acknowledge) returns (stream Event) {}
   
 }  
 message Cursor {
