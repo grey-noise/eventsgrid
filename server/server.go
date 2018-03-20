@@ -13,6 +13,7 @@ import (
 
 	consul "github.com/armon/consul-api"
 	prom "github.com/grpc-ecosystem/go-grpc-prometheus"
+	"github.com/minio/cli"
 	stan "github.com/nats-io/go-nats-streaming"
 	"github.com/oklog/ulid"
 	"github.com/prometheus/client_golang/prometheus"
@@ -102,10 +103,10 @@ func validate(eventID, endpoint string, json []byte) (valid bool) {
 	return false
 }
 
-// ListFeatures implements
 func (e *eventServer) SendEvents(stream pb.EventsSender_SendEventsServer) error {
 	messages := make(chan *pb.Event)
 	ctx := stream.Context()
+
 	go func() {
 		for {
 			select {
@@ -114,7 +115,6 @@ func (e *eventServer) SendEvents(stream pb.EventsSender_SendEventsServer) error 
 				var dst bytes.Buffer
 				json.Compact(&dst, msg.GetPayload())
 				log.Printf("message is received %+v", msg)
-
 				clientID := msg.GetHeader().GetClientId()
 				eventID := msg.GetHeader().GetEventid()
 				sc, err := stan.Connect(e.clusterID, clientID, stan.NatsURL(e.natsEP))
@@ -138,7 +138,6 @@ func (e *eventServer) SendEvents(stream pb.EventsSender_SendEventsServer) error 
 	}()
 
 	for {
-
 		in, err := stream.Recv()
 		if in == nil {
 			break
@@ -253,18 +252,53 @@ func (e *eventServer) GetEvents(a *pb.Acknowledge, stream pb.EventsSender_GetEve
 
 }
 
-func newServer() *eventServer {
-
-	natsEndpoint := getEnv("NATS-URL", "nats://open-faas.cloud.smals.be:4222")
-	clusterID := getEnv("CLUSTER-ID", "test-cluster")
-	consulEndpoint := getEnv("CONSUL-URL", "consul-ea.cloud.smals.be")
-	monitoring := getEnv("MONITORING-URL", "localhost:8000")
-	address := getEnv("URL", "localhost:8080")
-	return &eventServer{natsEP: natsEndpoint, clusterID: clusterID, consulEP: consulEndpoint, monitoringEP: monitoring, address: address}
-
-}
 func main() {
+	s := eventServer{}
+	app := cli.NewApp()
 
+	app.Flags = []cli.Flag{
+		cli.StringFlag{
+			Name:        "url",
+			Value:       "localhost:8080",
+			Usage:       "server endpoint",
+			Destination: &s.address,
+			EnvVar:      "URL"},
+		cli.StringFlag{
+			Name:        "monitoring",
+			Value:       "localhost:8000",
+			Usage:       "prometheus endpoint",
+			Destination: &s.monitoringEP,
+			EnvVar:      "MONITORING-URL"},
+		cli.StringFlag{
+			Name:        "consul",
+			Value:       "consul-ea.cloud.smals.be",
+			Usage:       "consul endpoint",
+			Destination: &s.consulEP,
+			EnvVar:      "CONSUL-URL"},
+		cli.StringFlag{
+			Name:        "nats",
+			Value:       "open-faas.cloud.smals.be:4222",
+			Usage:       "nats endpoint",
+			Destination: &s.natsEP,
+			EnvVar:      "NATS-URL"},
+		cli.StringFlag{
+			Name:        "clusterid",
+			Value:       "cluster-test",
+			Usage:       "cluster",
+			Destination: &s.clusterID,
+			EnvVar:      "CLUSTER-ID"},
+	}
+	app.Action = func(c *cli.Context) error {
+		s.run()
+		return nil
+	}
+	err := app.Run(os.Args)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+func (e *eventServer) run() {
+	log.Printf("server %+v", e)
 	msgSentCounter := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "message_sent",
 		Help: "Number of message sent to customer."},
@@ -282,9 +316,9 @@ func main() {
 			msgSentCounter.WithLabelValues(m.clientID, m.groupID, m.eventID).Inc()
 		}
 	}()
-	s := newServer()
+
 	var opts []grpc.ServerOption
-	lis, err := net.Listen("tcp", s.address)
+	lis, err := net.Listen("tcp", e.address)
 	if err != nil {
 		log.Printf("error is %s", err)
 		panic(err)
@@ -304,24 +338,15 @@ func main() {
 	opts = append(opts, grpc.StreamInterceptor(prom.StreamServerInterceptor))
 	opts = append(opts, grpc.UnaryInterceptor(prom.UnaryServerInterceptor))
 	grpcServer := grpc.NewServer(opts...)
-	pb.RegisterEventsSenderServer(grpcServer, s)
+	pb.RegisterEventsSenderServer(grpcServer, e)
 	prom.Register(grpcServer)
 
 	http.Handle("/metrics", prometheus.Handler())
-	h := &http.Server{Addr: s.monitoringEP}
+	h := &http.Server{Addr: e.monitoringEP}
 	go func() {
 		if err := h.ListenAndServe(); err != nil {
 			log.Fatal(err)
 		}
 	}()
 	log.Fatal(grpcServer.Serve(lis))
-}
-
-func getEnv(key, fallback string) string {
-	if value, ok := os.LookupEnv(key); ok {
-		log.Printf("%s:%s", key, value)
-		return value
-	}
-	log.Printf("%s:%s", key, fallback)
-	return fallback
 }
