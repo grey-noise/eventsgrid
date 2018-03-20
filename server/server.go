@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"io"
 	"log"
 	"math/rand"
 	"net"
@@ -14,15 +17,18 @@ import (
 	"github.com/oklog/ulid"
 	"github.com/prometheus/client_golang/prometheus"
 	pb "github.com/tixu/events-web-receivers-grpc/events"
+	schema "github.com/xeipuuv/gojsonschema"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 )
 
 var msgSent = make(chan counter)
+var msgRCV = make(chan counter)
 
 type counter struct {
 	clientID string
 	groupID  string
+	eventID  string
 }
 
 type eventServer struct {
@@ -54,7 +60,123 @@ func (e *eventServer) checkEvent(eventID string) bool {
 
 }
 
+func validate(eventID, endpoint string, json []byte) (valid bool) {
+
+	config := consul.Config{Address: endpoint}
+
+	// Get a new client, with KV endpoints
+	client, err := consul.NewClient(&config)
+	if err != nil {
+		log.Printf("Can't connect to Consul: check Consul  is running with address %s", endpoint)
+		return false
+	}
+	kv := client.KV()
+	path := "events/" + eventID + "/schema.json"
+	log.Printf("validating using schema %s", path)
+	pair, _, err := kv.Get(path, nil)
+	if err != nil {
+		log.Printf("error while getting schema : %v", err)
+		return false
+	}
+
+	schemaLoader := schema.NewBytesLoader(pair.Value)
+	jsonLoader := schema.NewStringLoader(string(json))
+	result, err := schema.Validate(schemaLoader, jsonLoader)
+
+	if err != nil {
+		log.Printf("error while validating document %v", err)
+		return false
+	}
+
+	if result.Valid() {
+		log.Printf("The document is valid\n")
+		return true
+	}
+
+	log.Printf("The document is not valid. see errors :\n")
+	for _, desc := range result.Errors() {
+		log.Printf("- %s\n", desc)
+	}
+	log.Printf("got an error while validating document")
+
+	return false
+}
+
 // ListFeatures implements
+func (e *eventServer) SendEvents(stream pb.EventsSender_SendEventsServer) error {
+	messages := make(chan *pb.Event)
+	ctx := stream.Context()
+	go func() {
+		for {
+			select {
+			case msg := <-messages:
+				log.Printf("receive a call from %s with groupID %s to store an event %s", msg.GetHeader().GetClientId(), msg.GetHeader().GetGroupId(), msg.GetHeader().GetEventid())
+				var dst bytes.Buffer
+				json.Compact(&dst, msg.GetPayload())
+				log.Printf("message is received %+v", msg)
+
+				clientID := msg.GetHeader().GetClientId()
+				eventID := msg.GetHeader().GetEventid()
+				sc, err := stan.Connect(e.clusterID, clientID, stan.NatsURL(e.natsEP))
+				if err != nil {
+					log.Printf("Can't connect to nats server %s \n Make sure a NATS Streaming Server %v  is running :%v", e.clusterID, clientID, stan.NatsURL(e.natsEP))
+				}
+				log.Printf("Connected to %s clusterID: [%s] clientID: [%s]\n", e.natsEP, e.clusterID, clientID)
+
+				err = sc.Publish(eventID, dst.Bytes())
+				if err != nil {
+					log.Fatalf("Error during publish: %v\n", err)
+				}
+				log.Printf("Published [%s] : '%s'\n", eventID, dst.Bytes())
+				sc.Close()
+
+			case <-ctx.Done():
+				log.Println("ctx done")
+				return
+			}
+		}
+	}()
+
+	for {
+
+		in, err := stream.Recv()
+		if in == nil {
+			break
+		}
+		msgRCV <- counter{clientID: in.GetHeader().GetClientId(), groupID: in.GetHeader().GetGroupId(), eventID: in.GetHeader().GetEventid()}
+		if err == io.EOF {
+			close(messages)
+			return nil
+
+		}
+		if err != nil {
+			return err
+		}
+		var s pb.Status
+		if validate(in.GetHeader().GetEventid(), e.consulEP, in.GetPayload()) {
+			log.Printf("in sent to backend %+v", in)
+			messages <- in
+			s = pb.Status{Code: pb.Status_OK, Description: "Valid"}
+
+		} else {
+			s = pb.Status{Code: pb.Status_NOK_VALID, Description: "not valid"}
+		}
+		h := pb.Header{
+			ClientId: in.GetHeader().GetClientId(),
+			GroupId:  in.GetHeader().GetGroupId(),
+			Eventid:  in.GetHeader().GetEventid()}
+		c := pb.Cursor{
+			Ts: time.Now().Unix(),
+			Id: 0}
+		a := &pb.Acknowledge{Header: &h, Cursor: &c, Status: &s}
+
+		if err := stream.Send(a); err != nil {
+			log.Printf("error while sending to the client")
+		}
+
+	}
+	return nil
+}
 
 func (e *eventServer) GetEvents(a *pb.Acknowledge, stream pb.EventsSender_GetEventsServer) error {
 	eventID := a.Header.GetEventid()
@@ -94,7 +216,7 @@ func (e *eventServer) GetEvents(a *pb.Acknowledge, stream pb.EventsSender_GetEve
 		h := &pb.Header{}
 		c := &pb.Cursor{Id: msg.Sequence, Ts: msg.Timestamp}
 		e := &pb.Event{Header: h, Cursor: c, Payload: msg.Data}
-		msgSent <- counter{clientID: clientID, groupID: groupID}
+		msgSent <- counter{clientID: clientID, groupID: groupID, eventID: eventID}
 		messages <- e
 
 	}
@@ -129,11 +251,11 @@ func (e *eventServer) GetEvents(a *pb.Acknowledge, stream pb.EventsSender_GetEve
 		}
 	}
 
-	return nil
 }
 
 func newServer() *eventServer {
-	natsEndpoint := getEnv("NATS-URL", "nats://open-faas.cloud.smals.be:4223")
+
+	natsEndpoint := getEnv("NATS-URL", "nats://open-faas.cloud.smals.be:4222")
 	clusterID := getEnv("CLUSTER-ID", "test-cluster")
 	consulEndpoint := getEnv("CONSUL-URL", "consul-ea.cloud.smals.be")
 	monitoring := getEnv("MONITORING-URL", "localhost:8000")
@@ -143,12 +265,13 @@ func newServer() *eventServer {
 }
 func main() {
 
-	msgCounter := prometheus.NewCounterVec(prometheus.CounterOpts{
+	msgSentCounter := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "message_sent",
 		Help: "Number of message sent to customer."},
-		[]string{"clientID", "groupID"},
+		[]string{"clientID", "groupID", "eventID"},
 	)
-	err := prometheus.Register(msgCounter)
+
+	err := prometheus.Register(msgSentCounter)
 	if err != nil {
 		log.Println("MSG counter couldn't be registered AGAIN, no counting will happen:", err)
 		return
@@ -156,7 +279,7 @@ func main() {
 
 	go func() {
 		for m := range msgSent {
-			msgCounter.WithLabelValues(m.clientID, m.groupID).Inc()
+			msgSentCounter.WithLabelValues(m.clientID, m.groupID, m.eventID).Inc()
 		}
 	}()
 	s := newServer()
@@ -166,6 +289,18 @@ func main() {
 		log.Printf("error is %s", err)
 		panic(err)
 	}
+	msgRCVCounter := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "message_receive",
+		Help: "Number of message receive customer."},
+		[]string{"clientID", "groupID", "eventID"},
+	)
+
+	go func() {
+		for m := range msgRCV {
+			msgRCVCounter.WithLabelValues(m.clientID, m.groupID, m.eventID).Inc()
+		}
+	}()
+
 	opts = append(opts, grpc.StreamInterceptor(prom.StreamServerInterceptor))
 	opts = append(opts, grpc.UnaryInterceptor(prom.UnaryServerInterceptor))
 	grpcServer := grpc.NewServer(opts...)

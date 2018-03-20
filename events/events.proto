@@ -9,6 +9,7 @@ package events;
 // Interface exported by the server.
 service EventsSender {
     rpc getEvents(Acknowledge) returns (stream Event) {}
+    rpc sendEvents(stream Event) returns (stream Acknowledge) {}
   
 }  
 message Cursor {
@@ -30,7 +31,23 @@ message Event {
     bytes payload = 3;
   }
 
+
+
+message Status {
+   enum Code {
+    OK = 0;
+    NOK_CONSUL = 1;
+    NOK_NATS = 2;
+    NOK_VALID = 3;
+    NOK_UNKOWN = 100;
+   }
+
+    Code  code = 1;
+    string description = 2;
+}
+
 message Acknowledge {
     Cursor cursor = 1;
     Header header = 2;
+    Status status = 3;
 }
