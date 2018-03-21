@@ -3,21 +3,23 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"math/rand"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"time"
 
 	consul "github.com/armon/consul-api"
+	pb "github.com/grey-noise/eventsgrids/events"
 	prom "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/minio/cli"
 	stan "github.com/nats-io/go-nats-streaming"
 	"github.com/oklog/ulid"
 	"github.com/prometheus/client_golang/prometheus"
-	pb "github.com/tixu/events-web-receivers-grpc/events"
 	schema "github.com/xeipuuv/gojsonschema"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -33,20 +35,23 @@ type counter struct {
 }
 
 type eventServer struct {
-	natsEP       string
-	clusterID    string
-	consulEP     string
-	monitoringEP string
-	address      string
+	natsEP          string
+	clusterID       string
+	storageEP       string
+	monitoringPort  int
+	port            int
+	serviceRegistry string
+	prom            *http.Server
+	grpcServer      *grpc.Server
 }
 
 func (e *eventServer) checkEvent(eventID string) bool {
-	config := consul.Config{Address: e.consulEP}
+	config := consul.Config{Address: e.storageEP}
 
 	// Get a new client, with KV endpoints
 	client, err := consul.NewClient(&config)
 	if err != nil {
-		log.Fatalf("Can't connect to Consul: check Consul  is running with address %s", e.consulEP)
+		log.Fatalf("Can't connect to Consul: check Consul  is running with address %s", e.storageEP)
 	}
 	kv := client.KV()
 	path := "events/" + eventID + "/schema.json"
@@ -120,6 +125,7 @@ func (e *eventServer) SendEvents(stream pb.EventsSender_SendEventsServer) error 
 				sc, err := stan.Connect(e.clusterID, clientID, stan.NatsURL(e.natsEP))
 				if err != nil {
 					log.Printf("Can't connect to nats server %s \n Make sure a NATS Streaming Server %v  is running :%v", e.clusterID, clientID, stan.NatsURL(e.natsEP))
+					return
 				}
 				log.Printf("Connected to %s clusterID: [%s] clientID: [%s]\n", e.natsEP, e.clusterID, clientID)
 
@@ -152,7 +158,7 @@ func (e *eventServer) SendEvents(stream pb.EventsSender_SendEventsServer) error 
 			return err
 		}
 		var s pb.Status
-		if validate(in.GetHeader().GetEventid(), e.consulEP, in.GetPayload()) {
+		if validate(in.GetHeader().GetEventid(), e.storageEP, in.GetPayload()) {
 			log.Printf("in sent to backend %+v", in)
 			messages <- in
 			s = pb.Status{Code: pb.Status_OK, Description: "Valid"}
@@ -257,30 +263,24 @@ func main() {
 	app := cli.NewApp()
 
 	app.Flags = []cli.Flag{
+		cli.IntFlag{
+			Name:        "seriveport",
+			Value:       8080,
+			Usage:       "server port endpoint",
+			Destination: &s.port,
+			EnvVar:      "EVENT_PORT"},
+		cli.IntFlag{
+			Name:        "monitoringport",
+			Value:       8000,
+			Usage:       "prometheus port endpoint",
+			Destination: &s.monitoringPort,
+			EnvVar:      "EVENT_MONITORING_PORT"},
 		cli.StringFlag{
-			Name:        "url",
-			Value:       "localhost:8080",
-			Usage:       "server endpoint",
-			Destination: &s.address,
-			EnvVar:      "URL"},
-		cli.StringFlag{
-			Name:        "monitoring",
-			Value:       "localhost:8000",
-			Usage:       "prometheus endpoint",
-			Destination: &s.monitoringEP,
-			EnvVar:      "MONITORING-URL"},
-		cli.StringFlag{
-			Name:        "consul",
-			Value:       "consul-ea.cloud.smals.be",
+			Name:        "service-Registry",
+			Value:       "localhost:8500",
 			Usage:       "consul endpoint",
-			Destination: &s.consulEP,
+			Destination: &s.serviceRegistry,
 			EnvVar:      "CONSUL-URL"},
-		cli.StringFlag{
-			Name:        "nats",
-			Value:       "open-faas.cloud.smals.be:4222",
-			Usage:       "nats endpoint",
-			Destination: &s.natsEP,
-			EnvVar:      "NATS-URL"},
 		cli.StringFlag{
 			Name:        "clusterid",
 			Value:       "cluster-test",
@@ -288,6 +288,7 @@ func main() {
 			Destination: &s.clusterID,
 			EnvVar:      "CLUSTER-ID"},
 	}
+
 	app.Action = func(c *cli.Context) error {
 		s.run()
 		return nil
@@ -296,57 +297,148 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	signalChan := make(chan os.Signal, 1)
+	cleanupDone := make(chan bool)
+	signal.Notify(signalChan, os.Interrupt, os.Kill)
+	go func() {
+		for _ = range signalChan {
+			fmt.Println("\nReceived an interrupt, stopping services...\n")
+			s.deregister()
+			s.stopMonitoring()
+			s.grpcServer.GracefulStop()
+
+			cleanupDone <- true
+		}
+	}()
+	<-cleanupDone
+	os.Exit(0)
+
 }
 func (e *eventServer) run() {
+	var err error
+	e.natsEP, err = e.getConfig("nats")
+	if err != nil {
+		log.Fatalf("Error while getting queing system %s", err)
+	}
+
+	e.storageEP, err = e.getConfig("storage")
+	if err != nil {
+		log.Fatalf("Error while getting queing storage %s", err)
+	}
+
+	var opts []grpc.ServerOption
+	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", e.port))
+	if err != nil {
+		log.Printf("error is %s", err)
+		panic(err)
+	}
+
+	opts = append(opts, grpc.StreamInterceptor(prom.StreamServerInterceptor))
+	opts = append(opts, grpc.UnaryInterceptor(prom.UnaryServerInterceptor))
+	e.grpcServer = grpc.NewServer(opts...)
+	pb.RegisterEventsSenderServer(e.grpcServer, e)
+	e.startMonitoring()
+
+	go e.grpcServer.Serve(lis)
 	log.Printf("server %+v", e)
+	e.register()
+
+}
+
+func (e *eventServer) deregister() {
+	log.Println("deregistering from registry")
+	config := consul.Config{Address: e.serviceRegistry}
+
+	// Get Service Endpoints
+	client, err := consul.NewClient(&config)
+	if err != nil {
+		log.Println("impossible to access configuration store %s", e.serviceRegistry)
+	}
+	agent := client.Agent()
+	err = agent.ServiceDeregister("Event-Server1")
+	if err != nil {
+		log.Print(err)
+	}
+
+}
+
+func (e *eventServer) register() {
+	config := consul.Config{Address: e.serviceRegistry}
+
+	// Get Service Endpoints
+	client, err := consul.NewClient(&config)
+	if err != nil {
+		log.Println("impossible to access configuration store %s", e.serviceRegistry)
+	}
+	c := consul.AgentServiceRegistration{ID: "Event-Server1", Name: "Event-Server", Port: 8000}
+
+	agent := client.Agent()
+	err = agent.ServiceRegister(&c)
+	if err != nil {
+		log.Print(err)
+	}
+}
+
+func (e *eventServer) getConfig(serviceName string) (endpoint string, err error) {
+	config := consul.Config{Address: e.serviceRegistry}
+
+	client, err := consul.NewClient(&config)
+	if err != nil {
+		return "", err
+	}
+	catalog := client.Catalog()
+
+	queueServices, _, err := catalog.Service(serviceName, "", &consul.QueryOptions{})
+	if len(queueServices) == 0 {
+		return "", fmt.Errorf("no nats services with key %s found", serviceName)
+	}
+	return fmt.Sprintf("%s:%d", queueServices[0].Address, queueServices[0].ServicePort), nil
+
+}
+
+func (e *eventServer) startMonitoring() {
 	msgSentCounter := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "message_sent",
 		Help: "Number of message sent to customer."},
 		[]string{"clientID", "groupID", "eventID"},
 	)
-
 	err := prometheus.Register(msgSentCounter)
 	if err != nil {
-		log.Println("MSG counter couldn't be registered AGAIN, no counting will happen:", err)
+		log.Println("MSG SENT counter couldn't be registered AGAIN, no counting will happen:", err)
 		return
-	}
-
-	go func() {
-		for m := range msgSent {
-			msgSentCounter.WithLabelValues(m.clientID, m.groupID, m.eventID).Inc()
-		}
-	}()
-
-	var opts []grpc.ServerOption
-	lis, err := net.Listen("tcp", e.address)
-	if err != nil {
-		log.Printf("error is %s", err)
-		panic(err)
 	}
 	msgRCVCounter := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "message_receive",
 		Help: "Number of message receive customer."},
 		[]string{"clientID", "groupID", "eventID"},
 	)
-
+	err = prometheus.Register(msgRCVCounter)
+	if err != nil {
+		log.Println("MSG RCV counter couldn't be registered AGAIN, no counting will happen:", err)
+		return
+	}
+	go func() {
+		for m := range msgSent {
+			msgSentCounter.WithLabelValues(m.clientID, m.groupID, m.eventID).Inc()
+		}
+	}()
 	go func() {
 		for m := range msgRCV {
 			msgRCVCounter.WithLabelValues(m.clientID, m.groupID, m.eventID).Inc()
 		}
 	}()
-
-	opts = append(opts, grpc.StreamInterceptor(prom.StreamServerInterceptor))
-	opts = append(opts, grpc.UnaryInterceptor(prom.UnaryServerInterceptor))
-	grpcServer := grpc.NewServer(opts...)
-	pb.RegisterEventsSenderServer(grpcServer, e)
-	prom.Register(grpcServer)
-
+	prom.Register(e.grpcServer)
 	http.Handle("/metrics", prometheus.Handler())
-	h := &http.Server{Addr: e.monitoringEP}
+	e.prom = &http.Server{Addr: fmt.Sprintf(":%d", e.monitoringPort)}
 	go func() {
-		if err := h.ListenAndServe(); err != nil {
+		if err := e.prom.ListenAndServe(); err != nil {
 			log.Fatal(err)
 		}
 	}()
-	log.Fatal(grpcServer.Serve(lis))
+
+}
+
+func (e *eventServer) stopMonitoring() {
+	e.prom.Shutdown(nil)
 }
