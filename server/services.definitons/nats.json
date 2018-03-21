@@ -1,0 +1,30 @@
+{
+    "Datacenter": "dc1",
+ 		"Node": "nats-node",
+		"Address": "open-faas.cloud.smals.be",
+	  "Service": {
+      "ID": "nats1",
+      "Service": "nats",
+      "Tags": [
+        "primary",
+				"events"
+      ],
+      "Address": "open-faas.cloud.smals.be",
+      "Port": 4222
+    },
+	 "Check": {
+    "Node": "nats-node",
+    "CheckID": "service:nats1",
+    "Name": "Nats health check",
+    "Notes": "Script based health check",
+    "Status": "passing",
+    "ServiceID": "nats1",
+    "Definition": {
+      "http": "http://nats-streaming-ea.cloud.smals.be/varz",
+      "Interval": "5s",
+      "Timeout": "1s",
+      "DeregisterCriticalServiceAfter": "30s"
+    }
+  },
+	"SkipNodeUpdate": false
+}

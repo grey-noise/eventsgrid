@@ -1,0 +1,30 @@
+{
+    "Datacenter": "dc1",
+ 		"Node": "storage-node",
+		"Address": "consul-ea.cloud.smals.be",
+	  "Service": {
+      "ID": "consul1",
+      "Service": "consul",
+      "Tags": [
+        "primary",
+				"events"
+      ],
+      "Address": "consul-ea.cloud.smals.be",
+      "Port": 80
+    },
+	 "Check": {
+    "Node": "storage-node",
+    "CheckID": "service:consul1",
+    "Name": "Consul health check",
+    "Notes": "Script based health check",
+    "Status": "passing",
+    "ServiceID": "consul1",
+    "Definition": {
+      "http": "http://consul-ea.cloud.smals.be/ui/#/dc1/services",
+      "Interval": "5s",
+      "Timeout": "1s",
+      "DeregisterCriticalServiceAfter": "30s"
+    }
+  },
+	"SkipNodeUpdate": false
+}
