@@ -7,7 +7,7 @@ import (
 	"os"
 	"time"
 
-	pb "github.com/tixu/events-web-receivers-grpc/events"
+	pb "github.com/grey-noise/eventsgrids/events"
 	"github.com/urfave/cli"
 	"google.golang.org/grpc"
 )
@@ -18,7 +18,7 @@ var request *int
 
 func main() {
 	app := cli.NewApp()
-	log.Println("\U0001f646\u200d\u2642")
+	log.Println("\U0001f197")
 	app.Flags = []cli.Flag{
 		cli.StringFlag{
 			Name:        "endpoint",
@@ -73,7 +73,7 @@ func sendEvents() {
 
 	stream, err := client.SendEvents(ctx)
 	if err != nil {
-		log.Fatalf(" %s  SendEvents(_) = _, %v", "\U0001f4a3", client, err)
+		log.Fatalf("%v.SendEvents(_) = _, %v", client, err)
 	}
 	waitc := make(chan struct{})
 	go func() {
@@ -87,19 +87,17 @@ func sendEvents() {
 			if err != nil {
 				log.Fatalf("Failed to receive an akckonwledgement : %v", err)
 			}
-			if in.Status.Code == pb.Status_OK {
-				log.Printf("%s ack : %+v", "\U0001f646\u200d\u2642", in)
-			} else {
-				log.Printf("%s ack : %+v", "\U0001f4a3", in)
-
+			if in.Status == pb.Status_OK {
+				log.Printf("ack : %+v", "", in)
 			}
+
 		}
 	}()
 	for _, event := range events {
 		i++
 		log.Println(i)
 		if err := stream.Send(event); err != nil {
-			log.Fatalf("%s Failed to send a note: %v", "\U0001f4a3", err)
+			log.Fatalf("Failed to send a note: %v", err)
 		}
 	}
 

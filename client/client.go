@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"time"
 
-	pb "github.com/tixu/events-web-receivers-grpc/events"
+	pb "github.com/grey-noise/eventsgrids/events"
 	"github.com/urfave/cli"
 	"google.golang.org/grpc"
 )
