@@ -12,8 +12,8 @@ curl --request PUT \
         "primary",
 				"events"
       ],
-      "Address": "consul-ea.cloud.smals.be",
-      "Port": 80
+      "Address": "localhost",
+      "Port": 8500
     },
 	 "Check": {
     "Node": "storage-node",
@@ -23,7 +23,7 @@ curl --request PUT \
     "Status": "passing",
     "ServiceID": "consul1",
     "Definition": {
-      "http": "http://consul-ea.cloud.smals.be/ui/#/dc1/services",
+      "http": "http://localhost:8500/ui/#/dc1/services",
       "Interval": "5s",
       "Timeout": "1s",
       "DeregisterCriticalServiceAfter": "30s"

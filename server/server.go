@@ -54,7 +54,7 @@ func (e *eventServer) checkEvent(eventID string) bool {
 		log.Fatalf("Can't connect to Consul: check Consul  is running with address %s", e.storageEP)
 	}
 	kv := client.KV()
-	path := "events/" + eventID + "/schema.json"
+	path := "events/" + eventID + "/schema"
 	log.Println(path)
 	pair, _, err := kv.Get(path, nil)
 	if err != nil || pair == nil {
@@ -77,7 +77,7 @@ func validate(eventID, endpoint string, json []byte) (valid bool) {
 		return false
 	}
 	kv := client.KV()
-	path := "events/" + eventID + "/schema.json"
+	path := "events/" + eventID + "/schema"
 	log.Printf("validating using schema %s", path)
 	pair, _, err := kv.Get(path, nil)
 	if err != nil {
@@ -86,7 +86,9 @@ func validate(eventID, endpoint string, json []byte) (valid bool) {
 	}
 
 	schemaLoader := schema.NewBytesLoader(pair.Value)
+	log.Println(string(pair.Value))
 	jsonLoader := schema.NewStringLoader(string(json))
+	log.Println(string(json))
 	result, err := schema.Validate(schemaLoader, jsonLoader)
 
 	if err != nil {
@@ -97,13 +99,15 @@ func validate(eventID, endpoint string, json []byte) (valid bool) {
 	if result.Valid() {
 		log.Printf("The document is valid\n")
 		return true
-	}
+	} else {
+		log.Printf("The document is not valid. see errors :\n")
+		for _, desc := range result.Errors() {
+			log.Printf("- %s\n", desc)
+		}
+		log.Printf("got an error while validating document")
+		return false
 
-	log.Printf("The document is not valid. see errors :\n")
-	for _, desc := range result.Errors() {
-		log.Printf("- %s\n", desc)
 	}
-	log.Printf("got an error while validating document")
 
 	return false
 }
@@ -113,8 +117,11 @@ func (e *eventServer) SendEvents(stream pb.EventsSender_SendEventsServer) error 
 	ctx := stream.Context()
 
 	go func() {
+		log.Println("lauching listener for events ")
 		for {
+			log.Println("listening for events ")
 			select {
+
 			case msg := <-messages:
 				log.Printf("receive a call from %s with groupID %s to store an event %s", msg.GetHeader().GetClientId(), msg.GetHeader().GetGroupId(), msg.GetHeader().GetEventid())
 				var dst bytes.Buffer
@@ -124,8 +131,10 @@ func (e *eventServer) SendEvents(stream pb.EventsSender_SendEventsServer) error 
 				eventID := msg.GetHeader().GetEventid()
 				sc, err := stan.Connect(e.clusterID, clientID, stan.NatsURL(e.natsEP))
 				if err != nil {
-					log.Printf("Can't connect to nats server %s \n Make sure a NATS Streaming Server %v  is running :%v", e.clusterID, clientID, stan.NatsURL(e.natsEP))
-					return
+
+					log.Printf("Can't connect to nats server %s \n Make sure a NATS Streaming Server %v  is running :%v", e.clusterID, clientID, e.natsEP)
+					log.Print(err)
+					break
 				}
 				log.Printf("Connected to %s clusterID: [%s] clientID: [%s]\n", e.natsEP, e.clusterID, clientID)
 
@@ -144,7 +153,9 @@ func (e *eventServer) SendEvents(stream pb.EventsSender_SendEventsServer) error 
 	}()
 
 	for {
+
 		in, err := stream.Recv()
+		log.Printf("receive %v \n", in)
 		if in == nil {
 			break
 		}
@@ -164,7 +175,7 @@ func (e *eventServer) SendEvents(stream pb.EventsSender_SendEventsServer) error 
 			s = pb.Status{Code: pb.Status_OK, Description: "Valid"}
 
 		} else {
-			s = pb.Status{Code: pb.Status_NOK_VALID, Description: "not valid"}
+			s = pb.Status{Code: pb.Status_NOK_VALID, Description: "Not valid"}
 		}
 		h := pb.Header{
 			ClientId: in.GetHeader().GetClientId(),
@@ -178,6 +189,8 @@ func (e *eventServer) SendEvents(stream pb.EventsSender_SendEventsServer) error 
 		if err := stream.Send(a); err != nil {
 			log.Printf("error while sending to the client")
 		}
+
+		log.Printf("send an ackowloedge %+v ", *a)
 
 	}
 	return nil
@@ -371,7 +384,7 @@ func (e *eventServer) register() {
 	if err != nil {
 		log.Println("impossible to access configuration store %s", e.serviceRegistry)
 	}
-	c := consul.AgentServiceRegistration{ID: "Event-Server1", Name: "Event-Server", Port: 8000}
+	c := consul.AgentServiceRegistration{ID: "Event-Server1", Name: "Event-Server", Port: e.port}
 
 	agent := client.Agent()
 	err = agent.ServiceRegister(&c)
@@ -382,7 +395,7 @@ func (e *eventServer) register() {
 
 func (e *eventServer) getConfig(serviceName string) (endpoint string, err error) {
 	config := consul.Config{Address: e.serviceRegistry}
-
+	log.Printf("looking for %s on %s \n", serviceName, e.serviceRegistry)
 	client, err := consul.NewClient(&config)
 	if err != nil {
 		return "", err
@@ -391,8 +404,9 @@ func (e *eventServer) getConfig(serviceName string) (endpoint string, err error)
 
 	queueServices, _, err := catalog.Service(serviceName, "", &consul.QueryOptions{})
 	if len(queueServices) == 0 {
-		return "", fmt.Errorf("no nats services with key %s found", serviceName)
+		return "", fmt.Errorf("no  services with key %s found", serviceName)
 	}
+	log.Printf("%s:%d", queueServices[0].Address, queueServices[0].ServicePort)
 	return fmt.Sprintf("%s:%d", queueServices[0].Address, queueServices[0].ServicePort), nil
 
 }
