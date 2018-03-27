@@ -9,7 +9,7 @@ import (
 	"time"
 
 	consul "github.com/armon/consul-api"
-	pb "github.com/grey-noise/eventsgrids/events"
+	pb "github.com/grey-noise/eventsgrid/events"
 	"github.com/urfave/cli"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"

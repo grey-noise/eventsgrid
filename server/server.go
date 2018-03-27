@@ -14,7 +14,7 @@ import (
 	"time"
 
 	consul "github.com/armon/consul-api"
-	pb "github.com/grey-noise/eventsgrids/events"
+	pb "github.com/grey-noise/eventsgrid/events"
 	prom "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/minio/cli"
 	stan "github.com/nats-io/go-nats-streaming"
