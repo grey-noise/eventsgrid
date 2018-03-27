@@ -12,6 +12,7 @@ import (
 	pb "github.com/grey-noise/eventsgrids/events"
 	"github.com/urfave/cli"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 )
 
 var registryEP string
@@ -24,7 +25,7 @@ func main() {
 	app.Flags = []cli.Flag{
 		cli.StringFlag{
 			Name:        "serviceRegistry",
-			Value:       "localhost:8500",
+			Value:       "consul-ea.cloud.smals.be",
 			Usage:       "service registry",
 			Destination: &registryEP},
 		cli.IntFlag{
@@ -43,9 +44,13 @@ func main() {
 				cli.IntFlag{Name: "request",
 					Value:       50,
 					Destination: request},
+				cli.StringFlag{Name: "clientID", EnvVar: "CLIENTID", Value: "ddd"},
+				cli.StringFlag{Name: "groupID", EnvVar: "GROUPID", Value: "grp"},
+				cli.StringFlag{Name: "eventID", EnvVar: "EVENTID", Value: "55f464c8-a702-45e8-ad78-ddab4892e8e2"},
 			},
 			Action: func(c *cli.Context) error {
-				sendEvents()
+				sc := sconn{ClientID: c.String("clientID"), GroupID: c.String("groupID"), EventID: c.String("eventID")}
+				sc.sendEvents(1000)
 				log.Println("number of request")
 				return nil
 			},
@@ -56,7 +61,7 @@ func main() {
 			Flags: []cli.Flag{
 				cli.StringFlag{Name: "clientID", EnvVar: "CLIENTID", Value: "ddd"},
 				cli.StringFlag{Name: "groupID", EnvVar: "GROUPID", Value: "grp"},
-				cli.StringFlag{Name: "eventID", EnvVar: "EVENTID", Value: "01C8QCMRNP82WBK2PVFRK9VABV"},
+				cli.StringFlag{Name: "eventID", EnvVar: "EVENTID", Value: "c41666ad-a1c0-4d5e-ae51-30c58d42deb7"},
 			},
 			Action: func(c *cli.Context) error {
 				log.Printf("client id : %s", c.String("clientID"))
@@ -73,6 +78,12 @@ func main() {
 	}
 }
 
+type sconn struct {
+	ClientID string
+	GroupID  string
+	EventID  string
+}
+
 func listen(eventID, clientID, groupID string) error {
 	serverEp, err := discover(registryEP, "Event-Server")
 	if err != nil {
@@ -86,24 +97,27 @@ func listen(eventID, clientID, groupID string) error {
 	}
 	defer conn.Close()
 	client := pb.NewEventsSenderClient(conn)
-	h := pb.Header{
-		ClientId: clientID,
-		GroupId:  groupID,
-		Eventid:  eventID}
 	c := pb.Cursor{
 		Ts: time.Now().Unix(),
 		Id: 0}
-	a := &pb.Acknowledge{Header: &h, Cursor: &c}
-	printEvents(client, a, *timeout)
+	a := &pb.Acknowledge{Cursor: &c}
+	con := sconn{ClientID: clientID, GroupID: groupID, EventID: eventID}
+	con.printEvents(client, a, 100)
 	return nil
 }
 
 // printFeatures lists all the features within the given bounding Rectangle.
-func printEvents(client pb.EventsSenderClient, a *pb.Acknowledge, timeout int) {
+func (c sconn) printEvents(client pb.EventsSenderClient, a *pb.Acknowledge, timeout int) {
 	log.Printf("Looking for events within %v", a)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
+	header := metadata.New(map[string]string{"clientID": c.ClientID,
+		"groupID": c.GroupID,
+		"eventID": c.EventID})
+	sctx := metadata.NewOutgoingContext(ctx, header)
+
 	defer cancel()
-	stream, err := client.GetEvents(ctx, a)
+
+	stream, err := client.GetEvents(sctx, a)
 	if err != nil {
 		log.Fatalf("%v.(_) = _, %v", client, err)
 	}
@@ -119,7 +133,7 @@ func printEvents(client pb.EventsSenderClient, a *pb.Acknowledge, timeout int) {
 	}
 }
 
-func sendEvents() {
+func (c sconn) sendEvents(timeout int) {
 
 	serverEp, err := discover(registryEP, "Event-Server")
 	if err != nil {
@@ -136,16 +150,21 @@ func sendEvents() {
 	client := pb.NewEventsSenderClient(conn)
 
 	waitc := make(chan struct{})
-	ctx, _ := context.WithTimeout(context.Background(), time.Duration(60)*time.Second)
-	stream, err := client.SendEvents(ctx)
+	ctx, _ := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
+
+	header := metadata.New(map[string]string{"clientID": c.ClientID,
+		"groupID": c.GroupID,
+		"eventID": c.EventID})
+	sctx := metadata.NewOutgoingContext(ctx, header)
+	stream, err := client.SendEvents(sctx)
 	if err != nil {
 		log.Fatalf("%v.SendEvents(_) = _, %v", client, err)
 	}
 
 	go func() {
 		events := []*pb.Event{
-			{Header: &pb.Header{ClientId: "123", Eventid: "c41666ad-a1c0-4d5e-ae51-30c58d42deb7", GroupId: "eeee"}, Payload: []byte("{\"function\" : \"dddd\"}")},
-			{Header: &pb.Header{ClientId: "123", Eventid: "c41666ad-a1c0-4d5e-ae51-30c58d42deb7", GroupId: "eeee"}, Payload: []byte("{\"function\" : \"edddd\"}")},
+			{Payload: []byte("{\"function\" : \"dddd\"}")},
+			//			{Payload: []byte("{\"function\" : \"edddd\"}")},
 		}
 
 		go func() {
@@ -196,19 +215,21 @@ func sendEvents() {
 }
 
 func discover(registryEP, serviceName string) (endpoint string, err error) {
-	log.Println("looking up for server")
+	log.Printf("looking up for service %s \n", serviceName)
 	config := consul.Config{Address: registryEP}
 
 	client, err := consul.NewClient(&config)
 	if err != nil {
 		return "", err
 	}
+	log.Println("got a client")
 	catalog := client.Catalog()
-
+	log.Println("got a catalog")
 	services, _, err := catalog.Service(serviceName, "", &consul.QueryOptions{})
 	if len(services) == 0 {
-		return "", fmt.Errorf("no nats services with key %s found", serviceName)
+		return "", fmt.Errorf("no  services with key %s found", serviceName)
 	}
+	log.Printf("%s:%d", services[0].Address, services[0].ServicePort)
 	return fmt.Sprintf("%s:%d", services[0].Address, services[0].ServicePort), nil
 
 }

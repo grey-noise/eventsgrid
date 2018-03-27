@@ -14,17 +14,10 @@ message Cursor {
     int64 ts =2;
 }
 
-message Header {
-    string clientId =   1;
-    string groupId  =   2;
-    string eventTypeId = 3;
-    string eventid =4;
-    string source = 5;
-}
+
 
 message Event {
     Cursor cursor = 1;
-    Header header = 2;
     bytes payload = 3;
   }
 
@@ -45,6 +38,5 @@ message Status {
 
 message Acknowledge {
     Cursor cursor = 1;
-    Header header = 2;
     Status status = 3;
 }

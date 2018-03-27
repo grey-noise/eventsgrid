@@ -23,6 +23,7 @@ import (
 	schema "github.com/xeipuuv/gojsonschema"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 )
 
 var msgSent = make(chan counter)
@@ -66,24 +67,30 @@ func (e *eventServer) checkEvent(eventID string) bool {
 
 }
 
+//validate : validating of the document
 func validate(eventID, endpoint string, json []byte) (valid bool) {
 
+	log.Printf("###################################")
 	config := consul.Config{Address: endpoint}
-
+	log.Printf("\t Get schema from the database Key/Value : \t %s", config)
 	// Get a new client, with KV endpoints
 	client, err := consul.NewClient(&config)
+
 	if err != nil {
 		log.Printf("Can't connect to Consul: check Consul  is running with address %s", endpoint)
 		return false
 	}
+
 	kv := client.KV()
 	path := "events/" + eventID + "/schema"
-	log.Printf("validating using schema %s", path)
+
 	pair, _, err := kv.Get(path, nil)
 	if err != nil {
 		log.Printf("error while getting schema : %v", err)
 		return false
 	}
+
+	log.Printf("Validating using schema %s", path)
 
 	schemaLoader := schema.NewBytesLoader(pair.Value)
 	log.Println(string(pair.Value))
@@ -97,7 +104,7 @@ func validate(eventID, endpoint string, json []byte) (valid bool) {
 	}
 
 	if result.Valid() {
-		log.Printf("The document is valid\n")
+		log.Printf("\n The document is valid\n")
 		return true
 	} else {
 		log.Printf("The document is not valid. see errors :\n")
@@ -115,36 +122,43 @@ func validate(eventID, endpoint string, json []byte) (valid bool) {
 func (e *eventServer) SendEvents(stream pb.EventsSender_SendEventsServer) error {
 	messages := make(chan *pb.Event)
 	ctx := stream.Context()
+	headers, _ := metadata.FromIncomingContext(ctx)
+	log.Printf("%+v", headers)
+
+	clientID := headers["clientid"][0] + "-emit"
+	groupID := headers["groupid"][0]
+	eventID := headers["eventid"][0]
 
 	go func() {
-		log.Println("lauching listener for events ")
+
 		for {
-			log.Println("listening for events ")
+
 			select {
 
 			case msg := <-messages:
-				log.Printf("receive a call from %s with groupID %s to store an event %s", msg.GetHeader().GetClientId(), msg.GetHeader().GetGroupId(), msg.GetHeader().GetEventid())
-				var dst bytes.Buffer
-				json.Compact(&dst, msg.GetPayload())
-				log.Printf("message is received %+v", msg)
-				clientID := msg.GetHeader().GetClientId()
-				eventID := msg.GetHeader().GetEventid()
+				log.Printf("###################################")
+				log.Printf("\t \t handling event send to \n \t cluster : %s, \n \t client ID : %s, \n \turl : %s \n", e.clusterID, clientID, e.natsEP)
+				log.Printf("###################################")
 				sc, err := stan.Connect(e.clusterID, clientID, stan.NatsURL(e.natsEP))
 				if err != nil {
-
 					log.Printf("Can't connect to nats server %s \n Make sure a NATS Streaming Server %v  is running :%v", e.clusterID, clientID, e.natsEP)
 					log.Print(err)
 					break
 				}
+
+				log.Printf("receive a call from %s with groupID %s to store an event %s", clientID, groupID, eventID)
+				var dst bytes.Buffer
+				json.Compact(&dst, msg.GetPayload())
+				log.Printf("message is received %+v", msg)
 				log.Printf("Connected to %s clusterID: [%s] clientID: [%s]\n", e.natsEP, e.clusterID, clientID)
 
 				err = sc.Publish(eventID, dst.Bytes())
 				if err != nil {
 					log.Fatalf("Error during publish: %v\n", err)
 				}
+
 				log.Printf("Published [%s] : '%s'\n", eventID, dst.Bytes())
 				sc.Close()
-
 			case <-ctx.Done():
 				log.Println("ctx done")
 				return
@@ -159,17 +173,17 @@ func (e *eventServer) SendEvents(stream pb.EventsSender_SendEventsServer) error 
 		if in == nil {
 			break
 		}
-		msgRCV <- counter{clientID: in.GetHeader().GetClientId(), groupID: in.GetHeader().GetGroupId(), eventID: in.GetHeader().GetEventid()}
+		msgRCV <- counter{clientID: clientID, groupID: groupID, eventID: eventID}
 		if err == io.EOF {
 			close(messages)
 			return nil
-
 		}
 		if err != nil {
 			return err
 		}
+
 		var s pb.Status
-		if validate(in.GetHeader().GetEventid(), e.storageEP, in.GetPayload()) {
+		if validate(eventID, e.storageEP, in.GetPayload()) {
 			log.Printf("in sent to backend %+v", in)
 			messages <- in
 			s = pb.Status{Code: pb.Status_OK, Description: "Valid"}
@@ -177,14 +191,10 @@ func (e *eventServer) SendEvents(stream pb.EventsSender_SendEventsServer) error 
 		} else {
 			s = pb.Status{Code: pb.Status_NOK_VALID, Description: "Not valid"}
 		}
-		h := pb.Header{
-			ClientId: in.GetHeader().GetClientId(),
-			GroupId:  in.GetHeader().GetGroupId(),
-			Eventid:  in.GetHeader().GetEventid()}
 		c := pb.Cursor{
 			Ts: time.Now().Unix(),
 			Id: 0}
-		a := &pb.Acknowledge{Header: &h, Cursor: &c, Status: &s}
+		a := &pb.Acknowledge{Cursor: &c, Status: &s}
 
 		if err := stream.Send(a); err != nil {
 			log.Printf("error while sending to the client")
@@ -197,7 +207,15 @@ func (e *eventServer) SendEvents(stream pb.EventsSender_SendEventsServer) error 
 }
 
 func (e *eventServer) GetEvents(a *pb.Acknowledge, stream pb.EventsSender_GetEventsServer) error {
-	eventID := a.Header.GetEventid()
+	ctx := stream.Context()
+
+	headers, _ := metadata.FromIncomingContext(ctx)
+	log.Printf("%+v", headers)
+
+	clientID := headers["clientid"][0] + "-listen"
+	groupID := headers["groupid"][0]
+	eventID := headers["eventid"][0]
+
 	log.Println("looking for event : ", eventID)
 	if eventID == "" {
 		log.Println("got no event to subscribe")
@@ -209,13 +227,11 @@ func (e *eventServer) GetEvents(a *pb.Acknowledge, stream pb.EventsSender_GetEve
 		return grpc.Errorf(codes.InvalidArgument, "eventid %s is unknown ", eventID)
 	}
 
-	clientID := a.Header.GetClientId()
 	if clientID == "" {
 		log.Println("Go no  X-ClientID generating one")
 		entropy := rand.New(rand.NewSource(time.Now().UnixNano()))
 		clientID = ulid.MustNew(ulid.Timestamp(time.Now()), entropy).String()
 	}
-	groupID := a.Header.GetGroupId()
 	if groupID == "" {
 		log.Println("Go no  X-ClientID generating one")
 		entropy := rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -224,6 +240,7 @@ func (e *eventServer) GetEvents(a *pb.Acknowledge, stream pb.EventsSender_GetEve
 	log.Printf("groupID is %s", groupID)
 
 	sc, err := stan.Connect(e.clusterID, clientID, stan.NatsURL(e.natsEP))
+
 	if err != nil {
 		log.Printf("Can't connect: %v.\nMake sure a NATS Streaming Server is running at: %s", err, e.natsEP)
 		return grpc.Errorf(codes.Internal, "Can't connect: %v.\nMake sure a NATS Streaming Server is running at: %s", err, e.natsEP)
@@ -231,9 +248,9 @@ func (e *eventServer) GetEvents(a *pb.Acknowledge, stream pb.EventsSender_GetEve
 
 	messages := make(chan *pb.Event)
 	mcb := func(msg *stan.Msg) {
-		h := &pb.Header{}
+
 		c := &pb.Cursor{Id: msg.Sequence, Ts: msg.Timestamp}
-		e := &pb.Event{Header: h, Cursor: c, Payload: msg.Data}
+		e := &pb.Event{Cursor: c, Payload: msg.Data}
 		msgSent <- counter{clientID: clientID, groupID: groupID, eventID: eventID}
 		messages <- e
 
@@ -246,7 +263,6 @@ func (e *eventServer) GetEvents(a *pb.Acknowledge, stream pb.EventsSender_GetEve
 		return grpc.Errorf(codes.Internal, "unable to create subcription %v", err)
 	}
 	log.Printf("subsribed  to queue %s with group %ss starting at %d", eventID, groupID, a.GetCursor().GetId())
-	ctx := stream.Context()
 	defer sub.Close()
 	for {
 		select {
@@ -290,13 +306,13 @@ func main() {
 			EnvVar:      "EVENT_MONITORING_PORT"},
 		cli.StringFlag{
 			Name:        "service-Registry",
-			Value:       "localhost:8500",
+			Value:       "consul-ea.cloud.smals.be",
 			Usage:       "consul endpoint",
 			Destination: &s.serviceRegistry,
 			EnvVar:      "CONSUL-URL"},
 		cli.StringFlag{
 			Name:        "clusterid",
-			Value:       "cluster-test",
+			Value:       "test-cluster",
 			Usage:       "cluster",
 			Destination: &s.clusterID,
 			EnvVar:      "CLUSTER-ID"},
@@ -384,10 +400,12 @@ func (e *eventServer) register() {
 	if err != nil {
 		log.Println("impossible to access configuration store %s", e.serviceRegistry)
 	}
-	c := consul.AgentServiceRegistration{ID: "Event-Server1", Name: "Event-Server", Port: e.port}
+	host, _ := os.Hostname()
+	s := consul.AgentService{ID: "Event-Server1", Service: "Event-Server", Port: e.port, Tags: []string{"events"}}
+	c := consul.CatalogRegistration{Node: host, Address: host, Datacenter: "dc1", Service: &s}
 
-	agent := client.Agent()
-	err = agent.ServiceRegister(&c)
+	catalog := client.Catalog()
+	_, err = catalog.Register(&c, nil)
 	if err != nil {
 		log.Print(err)
 	}

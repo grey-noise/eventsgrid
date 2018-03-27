@@ -1,7 +1,7 @@
 {
     "Datacenter": "dc1",
  		"Node": "nats-node",
-		"Address": "open-faas.cloud.smals.be",
+		"Address": "carbon.cloud.smals.be",
 	  "Service": {
       "ID": "nats1",
       "Service": "nats",
@@ -9,7 +9,7 @@
         "primary",
 				"events"
       ],
-      "Address": "open-faas.cloud.smals.be",
+      "Address": "carbon.cloud.smals.be",
       "Port": 4222
     },
 	 "Check": {
