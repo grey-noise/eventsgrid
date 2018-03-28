@@ -16,23 +16,45 @@ import (
 	consul "github.com/armon/consul-api"
 	pb "github.com/grey-noise/eventsgrid/events"
 	prom "github.com/grpc-ecosystem/go-grpc-prometheus"
-	"github.com/minio/cli"
 	stan "github.com/nats-io/go-nats-streaming"
 	"github.com/oklog/ulid"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/urfave/cli"
 	schema "github.com/xeipuuv/gojsonschema"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 )
 
+type ValidationError struct {
+	Message string
+}
+
+func (e ValidationError) Error() string {
+	return e.Message
+}
+
 var msgSent = make(chan counter)
 var msgRCV = make(chan counter)
+
+const (
+	ok                  = "OK"
+	valid               = "VALID"
+	unableTovalidate    = "UNABLE_TO_VALIDATE"
+	notValid            = "NOT_VALID"
+	notPublished        = "NOT_PUBLISHED"
+	unabletoPublish     = "UNABLE_TO_PUBLISH"
+	unknown             = "UNKNOWN"
+	received            = "RECEIVED"
+	unableToAcknowledge = "UNABLE_TO_ACKNOWLEDGED"
+	acknowledged        = "ACKNOWLEDGED"
+)
 
 type counter struct {
 	clientID string
 	groupID  string
 	eventID  string
+	status   string
 }
 
 type eventServer struct {
@@ -46,7 +68,7 @@ type eventServer struct {
 	grpcServer      *grpc.Server
 }
 
-func (e *eventServer) checkEvent(eventID string) bool {
+func (e *eventServer) acceptEvent(eventID string) bool {
 	config := consul.Config{Address: e.storageEP}
 
 	// Get a new client, with KV endpoints
@@ -68,62 +90,49 @@ func (e *eventServer) checkEvent(eventID string) bool {
 }
 
 //validate : validating of the document
-func validate(eventID, endpoint string, json []byte) (valid bool) {
+func validate(eventID, endpoint string, json []byte) (*ValidationError, error) {
 
-	log.Printf("###################################")
 	config := consul.Config{Address: endpoint}
-	log.Printf("\t Get schema from the database Key/Value : \t %s", config)
 	// Get a new client, with KV endpoints
 	client, err := consul.NewClient(&config)
-
 	if err != nil {
 		log.Printf("Can't connect to Consul: check Consul  is running with address %s", endpoint)
-		return false
+		return nil, err
 	}
-
 	kv := client.KV()
 	path := "events/" + eventID + "/schema"
-
 	pair, _, err := kv.Get(path, nil)
 	if err != nil {
 		log.Printf("error while getting schema : %v", err)
-		return false
+		return nil, err
 	}
-
-	log.Printf("Validating using schema %s", path)
-
 	schemaLoader := schema.NewBytesLoader(pair.Value)
-	log.Println(string(pair.Value))
+
 	jsonLoader := schema.NewStringLoader(string(json))
-	log.Println(string(json))
 	result, err := schema.Validate(schemaLoader, jsonLoader)
 
 	if err != nil {
 		log.Printf("error while validating document %v", err)
-		return false
+		return nil, err
 	}
 
 	if result.Valid() {
-		log.Printf("\n The document is valid\n")
-		return true
-	} else {
-		log.Printf("The document is not valid. see errors :\n")
-		for _, desc := range result.Errors() {
-			log.Printf("- %s\n", desc)
-		}
-		log.Printf("got an error while validating document")
-		return false
-
+		return nil, nil
 	}
+	log.Printf("The document is not valid. see errors :\n")
+	for _, desc := range result.Errors() {
+		log.Printf("- %s\n", desc)
+	}
+	log.Printf("got an error while validating document")
+	return &ValidationError{Message: "json invalid"}, nil
 
-	return false
 }
 
 func (e *eventServer) SendEvents(stream pb.EventsSender_SendEventsServer) error {
+	log.Println("client connection open")
 	messages := make(chan *pb.Event)
 	ctx := stream.Context()
 	headers, _ := metadata.FromIncomingContext(ctx)
-	log.Printf("%+v", headers)
 
 	clientID := headers["clientid"][0] + "-emit"
 	groupID := headers["groupid"][0]
@@ -136,31 +145,26 @@ func (e *eventServer) SendEvents(stream pb.EventsSender_SendEventsServer) error 
 			select {
 
 			case msg := <-messages:
-				log.Printf("###################################")
-				log.Printf("\t \t handling event send to \n \t cluster : %s, \n \t client ID : %s, \n \turl : %s \n", e.clusterID, clientID, e.natsEP)
-				log.Printf("###################################")
 				sc, err := stan.Connect(e.clusterID, clientID, stan.NatsURL(e.natsEP))
 				if err != nil {
 					log.Printf("Can't connect to nats server %s \n Make sure a NATS Streaming Server %v  is running :%v", e.clusterID, clientID, e.natsEP)
+					msgRCV <- counter{eventID: eventID, clientID: clientID, groupID: groupID, status: notPublished}
 					log.Print(err)
 					break
 				}
 
-				log.Printf("receive a call from %s with groupID %s to store an event %s", clientID, groupID, eventID)
 				var dst bytes.Buffer
 				json.Compact(&dst, msg.GetPayload())
-				log.Printf("message is received %+v", msg)
-				log.Printf("Connected to %s clusterID: [%s] clientID: [%s]\n", e.natsEP, e.clusterID, clientID)
-
 				err = sc.Publish(eventID, dst.Bytes())
 				if err != nil {
 					log.Fatalf("Error during publish: %v\n", err)
+					msgRCV <- counter{eventID: eventID, clientID: clientID, groupID: groupID, status: notPublished}
 				}
 
-				log.Printf("Published [%s] : '%s'\n", eventID, dst.Bytes())
+				msgRCV <- counter{eventID: eventID, clientID: clientID, groupID: groupID, status: ok}
 				sc.Close()
 			case <-ctx.Done():
-				log.Println("ctx done")
+				log.Println("client connection closed")
 				return
 			}
 		}
@@ -169,27 +173,34 @@ func (e *eventServer) SendEvents(stream pb.EventsSender_SendEventsServer) error 
 	for {
 
 		in, err := stream.Recv()
-		log.Printf("receive %v \n", in)
 		if in == nil {
 			break
 		}
-		msgRCV <- counter{clientID: clientID, groupID: groupID, eventID: eventID}
 		if err == io.EOF {
 			close(messages)
 			return nil
 		}
 		if err != nil {
-			return err
+			log.Printf("unable to open stream")
+			return grpc.Errorf(codes.Internal, "Unable to open stream: %v.\n", err)
 		}
+		msgRCV <- counter{clientID: clientID, groupID: groupID, eventID: eventID, status: received}
 
 		var s pb.Status
-		if validate(eventID, e.storageEP, in.GetPayload()) {
-			log.Printf("in sent to backend %+v", in)
-			messages <- in
-			s = pb.Status{Code: pb.Status_OK, Description: "Valid"}
-
+		verr, err := validate(eventID, e.storageEP, in.GetPayload())
+		if err != nil {
+			s = pb.Status{Code: pb.Status_NOK_UNKOWN, Description: err.Error()}
+			msgRCV <- counter{eventID: eventID, clientID: clientID, groupID: groupID, status: unableTovalidate}
 		} else {
-			s = pb.Status{Code: pb.Status_NOK_VALID, Description: "Not valid"}
+			if verr != nil {
+				s = pb.Status{Code: pb.Status_NOK_VALID, Description: "Not valid"}
+				msgRCV <- counter{eventID: eventID, clientID: clientID, groupID: groupID, status: notValid}
+			} else {
+				msgRCV <- counter{eventID: eventID, clientID: clientID, groupID: groupID, status: valid}
+
+				messages <- in
+				s = pb.Status{Code: pb.Status_OK, Description: "Valid"}
+			}
 		}
 		c := pb.Cursor{
 			Ts: time.Now().Unix(),
@@ -198,9 +209,9 @@ func (e *eventServer) SendEvents(stream pb.EventsSender_SendEventsServer) error 
 
 		if err := stream.Send(a); err != nil {
 			log.Printf("error while sending to the client")
+			msgRCV <- counter{eventID: eventID, clientID: clientID, groupID: groupID, status: unableToAcknowledge}
 		}
-
-		log.Printf("send an ackowloedge %+v ", *a)
+		msgRCV <- counter{eventID: eventID, clientID: clientID, groupID: groupID, status: acknowledged}
 
 	}
 	return nil
@@ -222,7 +233,7 @@ func (e *eventServer) GetEvents(a *pb.Acknowledge, stream pb.EventsSender_GetEve
 		return grpc.Errorf(codes.InvalidArgument, "event can not be empty ")
 
 	}
-	if !e.checkEvent(eventID) {
+	if !e.acceptEvent(eventID) {
 		log.Println("event unknown to subscribe")
 		return grpc.Errorf(codes.InvalidArgument, "eventid %s is unknown ", eventID)
 	}
@@ -353,7 +364,7 @@ func (e *eventServer) run() {
 
 	e.storageEP, err = e.getConfig("storage")
 	if err != nil {
-		log.Fatalf("Error while getting queing storage %s", err)
+		log.Fatalf("Error while getting  storage %s", err)
 	}
 
 	var opts []grpc.ServerOption
@@ -433,7 +444,7 @@ func (e *eventServer) startMonitoring() {
 	msgSentCounter := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "message_sent",
 		Help: "Number of message sent to customer."},
-		[]string{"clientID", "groupID", "eventID"},
+		[]string{"clientID", "groupID", "eventID", "status"},
 	)
 	err := prometheus.Register(msgSentCounter)
 	if err != nil {
@@ -443,7 +454,7 @@ func (e *eventServer) startMonitoring() {
 	msgRCVCounter := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "message_receive",
 		Help: "Number of message receive customer."},
-		[]string{"clientID", "groupID", "eventID"},
+		[]string{"clientID", "groupID", "eventID", "status"},
 	)
 	err = prometheus.Register(msgRCVCounter)
 	if err != nil {
@@ -452,12 +463,12 @@ func (e *eventServer) startMonitoring() {
 	}
 	go func() {
 		for m := range msgSent {
-			msgSentCounter.WithLabelValues(m.clientID, m.groupID, m.eventID).Inc()
+			msgSentCounter.WithLabelValues(m.clientID, m.groupID, m.eventID, m.status).Inc()
 		}
 	}()
 	go func() {
 		for m := range msgRCV {
-			msgRCVCounter.WithLabelValues(m.clientID, m.groupID, m.eventID).Inc()
+			msgRCVCounter.WithLabelValues(m.clientID, m.groupID, m.eventID, m.status).Inc()
 		}
 	}()
 	prom.Register(e.grpcServer)
