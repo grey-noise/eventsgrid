@@ -26,6 +26,7 @@ import (
 	schema "github.com/xeipuuv/gojsonschema"
 	"go.opencensus.io/exporter/zipkin"
 	"go.opencensus.io/trace"
+	"go.opencensus.io/zpages"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -375,14 +376,14 @@ func (e *eventServer) run() {
 
 	ctx := context.Background()
 	foo(ctx)
+
+	log.Println("trace config")
+	go func() {
+		http.Handle("/debug/", http.StripPrefix("/debug", zpages.Handler))
+		log.Fatal(http.ListenAndServe(":8081", nil))
+	}()
 	time.Sleep(15 * time.Second)
 	os.Exit(0)
-	/* 	log.Println("trace config")
-	   	go func() {
-	   		http.Handle("/debug/", http.StripPrefix("/debug", zpages.Handler))
-	   		log.Fatal(http.ListenAndServe(":8081", nil))
-	   	}()  */
-
 	/* 	e.natsEP, err = e.getConfig("nats")
 	   	if err != nil {
 	   		log.Fatalf("Error while getting queing system %s", err)
