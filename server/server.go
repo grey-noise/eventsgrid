@@ -382,7 +382,7 @@ func (e *eventServer) run() {
 		http.Handle("/debug/", http.StripPrefix("/debug", zpages.Handler))
 		log.Fatal(http.ListenAndServe(":8081", nil))
 	}()
-	time.Sleep(15 * time.Second)
+	//time.Sleep(15 * time.Second)
 	//os.Exit(0)
 	/* 	e.natsEP, err = e.getConfig("nats")
 	   	if err != nil {
