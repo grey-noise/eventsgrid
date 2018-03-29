@@ -2,12 +2,12 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"math/rand"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -18,9 +18,14 @@ import (
 	prom "github.com/grpc-ecosystem/go-grpc-prometheus"
 	stan "github.com/nats-io/go-nats-streaming"
 	"github.com/oklog/ulid"
+
+	openzipkin "github.com/openzipkin/zipkin-go"
+	zhttp "github.com/openzipkin/zipkin-go/reporter/http"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/urfave/cli"
 	schema "github.com/xeipuuv/gojsonschema"
+	"go.opencensus.io/exporter/zipkin"
+	"go.opencensus.io/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -139,11 +144,8 @@ func (e *eventServer) SendEvents(stream pb.EventsSender_SendEventsServer) error 
 	eventID := headers["eventid"][0]
 
 	go func() {
-
 		for {
-
 			select {
-
 			case msg := <-messages:
 				sc, err := stan.Connect(e.clusterID, clientID, stan.NatsURL(e.natsEP))
 				if err != nil {
@@ -152,7 +154,6 @@ func (e *eventServer) SendEvents(stream pb.EventsSender_SendEventsServer) error 
 					log.Print(err)
 					break
 				}
-
 				var dst bytes.Buffer
 				json.Compact(&dst, msg.GetPayload())
 				err = sc.Publish(eventID, dst.Bytes())
@@ -160,7 +161,6 @@ func (e *eventServer) SendEvents(stream pb.EventsSender_SendEventsServer) error 
 					log.Fatalf("Error during publish: %v\n", err)
 					msgRCV <- counter{eventID: eventID, clientID: clientID, groupID: groupID, status: notPublished}
 				}
-
 				msgRCV <- counter{eventID: eventID, clientID: clientID, groupID: groupID, status: ok}
 				sc.Close()
 			case <-ctx.Done():
@@ -171,8 +171,10 @@ func (e *eventServer) SendEvents(stream pb.EventsSender_SendEventsServer) error 
 	}()
 
 	for {
-
+		//_, span := trace.StartSpan(stream.Context(), "server.receive.message")
+		//span.End()
 		in, err := stream.Recv()
+
 		if in == nil {
 			break
 		}
@@ -185,7 +187,6 @@ func (e *eventServer) SendEvents(stream pb.EventsSender_SendEventsServer) error 
 			return grpc.Errorf(codes.Internal, "Unable to open stream: %v.\n", err)
 		}
 		msgRCV <- counter{clientID: clientID, groupID: groupID, eventID: eventID, status: received}
-
 		var s pb.Status
 		verr, err := validate(eventID, e.storageEP, in.GetPayload())
 		if err != nil {
@@ -197,7 +198,6 @@ func (e *eventServer) SendEvents(stream pb.EventsSender_SendEventsServer) error 
 				msgRCV <- counter{eventID: eventID, clientID: clientID, groupID: groupID, status: notValid}
 			} else {
 				msgRCV <- counter{eventID: eventID, clientID: clientID, groupID: groupID, status: valid}
-
 				messages <- in
 				s = pb.Status{Code: pb.Status_OK, Description: "Valid"}
 			}
@@ -206,13 +206,11 @@ func (e *eventServer) SendEvents(stream pb.EventsSender_SendEventsServer) error 
 			Ts: time.Now().Unix(),
 			Id: 0}
 		a := &pb.Acknowledge{Cursor: &c, Status: &s}
-
 		if err := stream.Send(a); err != nil {
 			log.Printf("error while sending to the client")
 			msgRCV <- counter{eventID: eventID, clientID: clientID, groupID: groupID, status: unableToAcknowledge}
 		}
 		msgRCV <- counter{eventID: eventID, clientID: clientID, groupID: groupID, status: acknowledged}
-
 	}
 	return nil
 }
@@ -333,6 +331,7 @@ func main() {
 		s.run()
 		return nil
 	}
+
 	err := app.Run(os.Args)
 	if err != nil {
 		log.Fatal(err)
@@ -356,34 +355,96 @@ func main() {
 
 }
 func (e *eventServer) run() {
-	var err error
-	e.natsEP, err = e.getConfig("nats")
+	// The localEndpoint stores the name and address of the local service
+	localEndpoint, err := openzipkin.NewEndpoint("example-server", "192.168.1.5:5454")
 	if err != nil {
-		log.Fatalf("Error while getting queing system %s", err)
+		log.Println(err)
 	}
 
-	e.storageEP, err = e.getConfig("storage")
-	if err != nil {
-		log.Fatalf("Error while getting  storage %s", err)
-	}
+	// The Zipkin reporter takes collected spans from the app and reports them to the backend
+	// http://localhost:9411/api/v2/spans is the default for the Zipkin Span v2
+	reporter := zhttp.NewReporter("http://localhost:9411/api/v2/spans")
+	defer reporter.Close()
 
-	var opts []grpc.ServerOption
-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", e.port))
-	if err != nil {
-		log.Printf("error is %s", err)
-		panic(err)
-	}
+	// The OpenCensus exporter wraps the Zipkin reporter
+	exporter := zipkin.NewExporter(reporter, localEndpoint)
+	trace.RegisterExporter(exporter)
 
-	opts = append(opts, grpc.StreamInterceptor(prom.StreamServerInterceptor))
-	opts = append(opts, grpc.UnaryInterceptor(prom.UnaryServerInterceptor))
-	e.grpcServer = grpc.NewServer(opts...)
-	pb.RegisterEventsSenderServer(e.grpcServer, e)
-	e.startMonitoring()
+	// For example purposes, sample every trace.
+	trace.ApplyConfig(trace.Config{DefaultSampler: trace.AlwaysSample()})
 
-	go e.grpcServer.Serve(lis)
-	log.Printf("server %+v", e)
-	e.register()
+	ctx := context.Background()
+	foo(ctx)
+	time.Sleep(15 * time.Second)
+	os.Exit(0)
+	/* 	log.Println("trace config")
+	   	go func() {
+	   		http.Handle("/debug/", http.StripPrefix("/debug", zpages.Handler))
+	   		log.Fatal(http.ListenAndServe(":8081", nil))
+	   	}()  */
 
+	/* 	e.natsEP, err = e.getConfig("nats")
+	   	if err != nil {
+	   		log.Fatalf("Error while getting queing system %s", err)
+	   	}
+
+	   	e.storageEP, err = e.getConfig("storage")
+	   	if err != nil {
+	   		log.Fatalf("Error while getting  storage %s", err)
+	   	}
+
+	   	var opts []grpc.ServerOption
+	   	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", e.port))
+	   	if err != nil {
+	   		log.Printf("error is %s", err)
+	   		panic(err)
+	   	}
+
+	   	//Set up a new server with the OpenCensus
+	   	// stats handler to enable stats and tracing.
+
+	   	opts = append(opts, grpc.StreamInterceptor(prom.StreamServerInterceptor))
+	   	opts = append(opts, grpc.UnaryInterceptor(prom.UnaryServerInterceptor))
+	   	opts = append(opts, grpc.StatsHandler(&ocgrpc.ServerHandler{}))
+	   	e.grpcServer = grpc.NewServer(opts...)
+	   	pb.RegisterEventsSenderServer(e.grpcServer, e)
+	   	reflection.Register(e.grpcServer)
+
+	   	e.startMonitoring()
+
+	   	go e.grpcServer.Serve(lis)
+	   	log.Printf("server %+v", e)
+	   	e.register() */
+
+}
+
+func foo(ctx context.Context) {
+	log.Println("je asse ici")
+	// Name the current span "/foo"
+	ctx, span := trace.StartSpan(ctx, "/foo")
+	defer span.End()
+
+	// Foo calls bar and baz
+	bar(ctx)
+	baz(ctx)
+}
+
+func bar(ctx context.Context) {
+	log.Println("yeaa")
+	ctx, span := trace.StartSpan(ctx, "/bar")
+	defer span.End()
+
+	// Do bar
+	time.Sleep(2 * time.Millisecond)
+}
+
+func baz(ctx context.Context) {
+	log.Print("bang")
+	ctx, span := trace.StartSpan(ctx, "/baz")
+	defer span.End()
+
+	// Do baz
+	time.Sleep(4 * time.Millisecond)
 }
 
 func (e *eventServer) deregister() {
