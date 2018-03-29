@@ -383,7 +383,7 @@ func (e *eventServer) run() {
 		log.Fatal(http.ListenAndServe(":8081", nil))
 	}()
 	time.Sleep(15 * time.Second)
-	os.Exit(0)
+	//os.Exit(0)
 	/* 	e.natsEP, err = e.getConfig("nats")
 	   	if err != nil {
 	   		log.Fatalf("Error while getting queing system %s", err)
