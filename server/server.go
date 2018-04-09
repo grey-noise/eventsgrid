@@ -6,16 +6,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"time"
 
-	consul "github.com/armon/consul-api"
+	log "github.com/Sirupsen/logrus"
+
 	pb "github.com/grey-noise/eventsgrid/events"
 	prom "github.com/grpc-ecosystem/go-grpc-prometheus"
+	consul "github.com/hashicorp/consul/api"
 	stan "github.com/nats-io/go-nats-streaming"
 	"github.com/oklog/ulid"
 
@@ -30,6 +32,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/reflection"
 )
 
 type ValidationError struct {
@@ -146,15 +149,19 @@ func (e *eventServer) SendEvents(stream pb.EventsSender_SendEventsServer) error 
 
 	go func() {
 		for {
+		inner:
 			select {
+
 			case msg := <-messages:
+
 				sc, err := stan.Connect(e.clusterID, clientID, stan.NatsURL(e.natsEP))
 				if err != nil {
-					log.Printf("Can't connect to nats server %s \n Make sure a NATS Streaming Server %v  is running :%v", e.clusterID, clientID, e.natsEP)
+					log.Printf("Can't connect to nats server %s \n Make sure a NATS Streaming Server %v  is running :%v", e.clusterID, e.clusterID, e.natsEP)
 					msgRCV <- counter{eventID: eventID, clientID: clientID, groupID: groupID, status: notPublished}
 					log.Print(err)
-					break
+					break inner
 				}
+
 				var dst bytes.Buffer
 				json.Compact(&dst, msg.GetPayload())
 				err = sc.Publish(eventID, dst.Bytes())
@@ -164,6 +171,7 @@ func (e *eventServer) SendEvents(stream pb.EventsSender_SendEventsServer) error 
 				}
 				msgRCV <- counter{eventID: eventID, clientID: clientID, groupID: groupID, status: ok}
 				sc.Close()
+
 			case <-ctx.Done():
 				log.Println("client connection closed")
 				return
@@ -172,16 +180,16 @@ func (e *eventServer) SendEvents(stream pb.EventsSender_SendEventsServer) error 
 	}()
 
 	for {
-		//_, span := trace.StartSpan(stream.Context(), "server.receive.message")
-		//span.End()
-		in, err := stream.Recv()
 
+		in, err := stream.Recv()
 		if in == nil {
-			break
+			return grpc.Errorf(codes.Internal, "Unable to open stream: %v.\n")
+
 		}
 		if err == io.EOF {
 			close(messages)
-			return nil
+			return grpc.Errorf(codes.Internal, "Unable to open stream: %v.\n", err)
+
 		}
 		if err != nil {
 			log.Printf("unable to open stream")
@@ -212,6 +220,7 @@ func (e *eventServer) SendEvents(stream pb.EventsSender_SendEventsServer) error 
 			msgRCV <- counter{eventID: eventID, clientID: clientID, groupID: groupID, status: unableToAcknowledge}
 		}
 		msgRCV <- counter{eventID: eventID, clientID: clientID, groupID: groupID, status: acknowledged}
+
 	}
 	return nil
 }
@@ -316,13 +325,13 @@ func main() {
 			EnvVar:      "EVENT_MONITORING_PORT"},
 		cli.StringFlag{
 			Name:        "service-Registry",
-			Value:       "consul-ea.cloud.smals.be",
+			Value:       "localhost:8500",
 			Usage:       "consul endpoint",
 			Destination: &s.serviceRegistry,
 			EnvVar:      "CONSUL-URL"},
 		cli.StringFlag{
 			Name:        "clusterid",
-			Value:       "test-cluster",
+			Value:       "events",
 			Usage:       "cluster",
 			Destination: &s.clusterID,
 			EnvVar:      "CLUSTER-ID"},
@@ -382,40 +391,36 @@ func (e *eventServer) run() {
 		http.Handle("/debug/", http.StripPrefix("/debug", zpages.Handler))
 		log.Fatal(http.ListenAndServe(":8081", nil))
 	}()
-	//time.Sleep(15 * time.Second)
-	//os.Exit(0)
-	/* 	e.natsEP, err = e.getConfig("nats")
-	   	if err != nil {
-	   		log.Fatalf("Error while getting queing system %s", err)
-	   	}
+	e.natsEP, err = e.getConfig("nats")
+	if err != nil {
+		log.Fatalf("Error while getting queing system %s", err)
+	}
+	e.storageEP, err = e.getConfig("storage")
+	if err != nil {
+		log.Fatalf("Error while getting  storage %s", err)
+	}
+	var opts []grpc.ServerOption
+	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", e.port))
+	if err != nil {
+		log.Printf("error is %s", err)
+		panic(err)
+	}
 
-	   	e.storageEP, err = e.getConfig("storage")
-	   	if err != nil {
-	   		log.Fatalf("Error while getting  storage %s", err)
-	   	}
+	//Set up a new server with the OpenCensus
+	// stats handler to enable stats and tracing.
 
-	   	var opts []grpc.ServerOption
-	   	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", e.port))
-	   	if err != nil {
-	   		log.Printf("error is %s", err)
-	   		panic(err)
-	   	}
+	opts = append(opts, grpc.StreamInterceptor(prom.StreamServerInterceptor))
+	opts = append(opts, grpc.UnaryInterceptor(prom.UnaryServerInterceptor))
+	//opts = append(opts, grpc.StatsHandler(&ocgrpc.ServerHandler{}))
+	e.grpcServer = grpc.NewServer(opts...)
+	pb.RegisterEventsSenderServer(e.grpcServer, e)
+	reflection.Register(e.grpcServer)
 
-	   	//Set up a new server with the OpenCensus
-	   	// stats handler to enable stats and tracing.
+	e.startMonitoring()
 
-	   	opts = append(opts, grpc.StreamInterceptor(prom.StreamServerInterceptor))
-	   	opts = append(opts, grpc.UnaryInterceptor(prom.UnaryServerInterceptor))
-	   	opts = append(opts, grpc.StatsHandler(&ocgrpc.ServerHandler{}))
-	   	e.grpcServer = grpc.NewServer(opts...)
-	   	pb.RegisterEventsSenderServer(e.grpcServer, e)
-	   	reflection.Register(e.grpcServer)
-
-	   	e.startMonitoring()
-
-	   	go e.grpcServer.Serve(lis)
-	   	log.Printf("server %+v", e)
-	   	e.register() */
+	go e.grpcServer.Serve(lis)
+	log.Printf("server %+v", e)
+	e.register()
 
 }
 
@@ -466,22 +471,30 @@ func (e *eventServer) deregister() {
 }
 
 func (e *eventServer) register() {
+	log.Println("Registering service ")
 	config := consul.Config{Address: e.serviceRegistry}
 
 	// Get Service Endpoints
 	client, err := consul.NewClient(&config)
 	if err != nil {
-		log.Println("impossible to access configuration store %s", e.serviceRegistry)
+		log.Println("impossible to access service registry %s", e.serviceRegistry)
 	}
 	host, _ := os.Hostname()
-	s := consul.AgentService{ID: "Event-Server1", Service: "Event-Server", Port: e.port, Tags: []string{"events"}}
-	c := consul.CatalogRegistration{Node: host, Address: host, Datacenter: "dc1", Service: &s}
+	//	s := consul.AgentService{ID: "Event-Server1", Service: "Event-Server", Port: e.port, Tags: []string{"events"}}
+	//	c := consul.CatalogRegistration{Node: host, Address: host, Datacenter: "dc1", Service: &s}
 
-	catalog := client.Catalog()
-	_, err = catalog.Register(&c, nil)
+	//	catalog := client.Catalog()
+	agent := client.Agent()
+	err = agent.ServiceRegister(&consul.AgentServiceRegistration{ID: "Event-Server1", Name: "Event-Server", Address: host, Port: e.port, Tags: []string{"events"}})
+	//	_, err = catalog.Register(&c, nil)
+	if err != nil {
+		log.Fatalf("\U0001F4A9 \t %s", err)
+	}
+	/*_, err = catalog.Register(&c, nil)
 	if err != nil {
 		log.Print(err)
-	}
+	}*/
+	log.Println("\U0001f197 \t service registered")
 }
 
 func (e *eventServer) getConfig(serviceName string) (endpoint string, err error) {
