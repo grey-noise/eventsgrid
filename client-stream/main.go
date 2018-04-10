@@ -4,13 +4,18 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"time"
 
+	log "github.com/Sirupsen/logrus"
 	consul "github.com/armon/consul-api"
 	pb "github.com/grey-noise/eventsgrid/events"
+	openzipkin "github.com/openzipkin/zipkin-go"
+	zhttp "github.com/openzipkin/zipkin-go/reporter/http"
 	"github.com/urfave/cli"
+	"go.opencensus.io/exporter/zipkin"
+	"go.opencensus.io/plugin/ocgrpc"
+	"go.opencensus.io/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 )
@@ -25,7 +30,7 @@ func main() {
 	app.Flags = []cli.Flag{
 		cli.StringFlag{
 			Name:        "serviceRegistry",
-			Value:       "consul-ea.cloud.smals.be",
+			Value:       "localhost:8500",
 			Usage:       "service registry",
 			Destination: &registryEP},
 		cli.IntFlag{
@@ -46,12 +51,12 @@ func main() {
 					Destination: request},
 				cli.StringFlag{Name: "clientID", EnvVar: "CLIENTID", Value: "ddd"},
 				cli.StringFlag{Name: "groupID", EnvVar: "GROUPID", Value: "grp"},
-				cli.StringFlag{Name: "eventID", EnvVar: "EVENTID", Value: "55f464c8-a702-45e8-ad78-ddab4892e8e2"},
+				cli.StringFlag{Name: "eventID", EnvVar: "EVENTID", Value: "c41666ad-a1c0-4d5e-ae51-30c58d42deb7"},
 			},
 			Action: func(c *cli.Context) error {
 				sc := sconn{ClientID: c.String("clientID"), GroupID: c.String("groupID"), EventID: c.String("eventID")}
-				sc.sendEvents(1000)
-				log.Println("number of request")
+				sc.sendEvents(10)
+
 				return nil
 			},
 		}, {
@@ -135,12 +140,24 @@ func (c sconn) printEvents(client pb.EventsSenderClient, a *pb.Acknowledge, time
 
 func (c sconn) sendEvents(timeout int) {
 
+	localEndpoint, err := openzipkin.NewEndpoint("server", "localhost:5454")
+	if err != nil {
+		log.Print(err)
+	}
+	reporter := zhttp.NewReporter("http://localhost:9411/api/v2/spans")
+	defer reporter.Close()
+	exporter := zipkin.NewExporter(reporter, localEndpoint)
+
+	trace.RegisterExporter(exporter)
+	trace.SetDefaultSampler(trace.AlwaysSample())
+
 	serverEp, err := discover(registryEP, "Event-Server")
 	if err != nil {
-		log.Fatalf("error while looking up service")
+		log.Fatalf("error while looking up service", err)
 	}
 	var opts []grpc.DialOption
 	opts = append(opts, grpc.WithInsecure())
+	opts = append(opts, grpc.WithStatsHandler(&ocgrpc.ClientHandler{}))
 	log.Printf("serverEP:%s", serverEp)
 	conn, err := grpc.Dial(serverEp, opts...)
 	if err != nil {
@@ -155,32 +172,29 @@ func (c sconn) sendEvents(timeout int) {
 	header := metadata.New(map[string]string{"clientID": c.ClientID,
 		"groupID": c.GroupID,
 		"eventID": c.EventID})
+	log.Infof("initiating connection with %+v", header)
 	sctx := metadata.NewOutgoingContext(ctx, header)
 	stream, err := client.SendEvents(sctx)
 	if err != nil {
 		log.Fatalf("%v.SendEvents(_) = _, %v", client, err)
 	}
 
-	go func() {
-		events := []*pb.Event{
-			{Payload: []byte("{\"function\" : \"dddd\"}")},
-			//			{Payload: []byte("{\"function\" : \"edddd\"}")},
+	events := []*pb.Event{
+		{Payload: []byte("{\"function\" : \"dddd\"}")},
+		{Payload: []byte("{\"function\" : \"edddd\"}")},
+	}
+
+	for _, event := range events {
+		log.Printf("sending event %v", event)
+		if err := stream.Send(event); err != nil {
+			log.Fatalf("Failed to send a note: %v", err)
 		}
-
-		go func() {
-			for _, event := range events {
-				log.Printf("sending event %v", event)
-				if err := stream.Send(event); err != nil {
-					log.Fatalf("Failed to send a note: %v", err)
-				}
-				log.Printf("sent event %v", event)
-			}
-			if err := stream.CloseSend(); err != nil {
-				log.Print(err)
-			}
-		}()
-
-	}()
+		log.Printf("sent event %v", event)
+	}
+	log.Info("closing")
+	if err := stream.CloseSend(); err != nil {
+		log.Print(err)
+	}
 
 	go func() {
 		log.Println("receiving message")
@@ -188,15 +202,15 @@ func (c sconn) sendEvents(timeout int) {
 			log.Println("waiting  message")
 
 			in, err := stream.Recv()
-			log.Print("received")
 			if err == io.EOF {
 				// read done.
+				stream.CloseSend()
 				close(waitc)
 				break
 			}
 			if err != nil {
 				log.Fatalf("Failed to receive an akckonwledgement : %v", err)
-				break
+
 			}
 			log.Printf("receive %+v", in)
 
@@ -215,7 +229,7 @@ func (c sconn) sendEvents(timeout int) {
 }
 
 func discover(registryEP, serviceName string) (endpoint string, err error) {
-	log.Printf("looking up for service %s \n", serviceName)
+	log.Printf("looking up for service %s at %s \n", serviceName, registryEP)
 	config := consul.Config{Address: registryEP}
 
 	client, err := consul.NewClient(&config)

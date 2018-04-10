@@ -14,19 +14,19 @@ import (
 	"time"
 
 	log "github.com/Sirupsen/logrus"
-
 	pb "github.com/grey-noise/eventsgrid/events"
 	prom "github.com/grpc-ecosystem/go-grpc-prometheus"
 	consul "github.com/hashicorp/consul/api"
 	stan "github.com/nats-io/go-nats-streaming"
 	"github.com/oklog/ulid"
-
 	openzipkin "github.com/openzipkin/zipkin-go"
-	zhttp "github.com/openzipkin/zipkin-go/reporter/http"
+	zipkinhttp "github.com/openzipkin/zipkin-go/reporter/http"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/urfave/cli"
 	schema "github.com/xeipuuv/gojsonschema"
 	"go.opencensus.io/exporter/zipkin"
+	"go.opencensus.io/plugin/ocgrpc"
+
 	"go.opencensus.io/trace"
 	"go.opencensus.io/zpages"
 	"google.golang.org/grpc"
@@ -147,52 +147,23 @@ func (e *eventServer) SendEvents(stream pb.EventsSender_SendEventsServer) error 
 	groupID := headers["groupid"][0]
 	eventID := headers["eventid"][0]
 
-	go func() {
-		for {
-		inner:
-			select {
-
-			case msg := <-messages:
-
-				sc, err := stan.Connect(e.clusterID, clientID, stan.NatsURL(e.natsEP))
-				if err != nil {
-					log.Printf("Can't connect to nats server %s \n Make sure a NATS Streaming Server %v  is running :%v", e.clusterID, e.clusterID, e.natsEP)
-					msgRCV <- counter{eventID: eventID, clientID: clientID, groupID: groupID, status: notPublished}
-					log.Print(err)
-					break inner
-				}
-
-				var dst bytes.Buffer
-				json.Compact(&dst, msg.GetPayload())
-				err = sc.Publish(eventID, dst.Bytes())
-				if err != nil {
-					log.Fatalf("Error during publish: %v\n", err)
-					msgRCV <- counter{eventID: eventID, clientID: clientID, groupID: groupID, status: notPublished}
-				}
-				msgRCV <- counter{eventID: eventID, clientID: clientID, groupID: groupID, status: ok}
-				sc.Close()
-
-			case <-ctx.Done():
-				log.Println("client connection closed")
-				return
-			}
-		}
-	}()
-
 	for {
 
 		in, err := stream.Recv()
+		_, spa := trace.StartSpan(stream.Context(), "processing")
+		spa.AddAttributes(trace.StringAttribute("sss", "sss"))
 		if in == nil {
-			return grpc.Errorf(codes.Internal, "Unable to open stream: %v.\n")
-
+			spa.End()
+			return nil
 		}
 		if err == io.EOF {
 			close(messages)
+			spa.End()
 			return grpc.Errorf(codes.Internal, "Unable to open stream: %v.\n", err)
 
 		}
 		if err != nil {
-			log.Printf("unable to open stream")
+			log.Error("unable to open stream", e)
 			return grpc.Errorf(codes.Internal, "Unable to open stream: %v.\n", err)
 		}
 		msgRCV <- counter{clientID: clientID, groupID: groupID, eventID: eventID, status: received}
@@ -207,14 +178,31 @@ func (e *eventServer) SendEvents(stream pb.EventsSender_SendEventsServer) error 
 				msgRCV <- counter{eventID: eventID, clientID: clientID, groupID: groupID, status: notValid}
 			} else {
 				msgRCV <- counter{eventID: eventID, clientID: clientID, groupID: groupID, status: valid}
-				messages <- in
+				sc, err := stan.Connect(e.clusterID, clientID, stan.NatsURL(e.natsEP))
+				if err != nil {
+					log.WithField("clusterId", e.clusterID).WithField("natsEP", e.natsEP).Error("Can't connect to nats server")
+					msgRCV <- counter{eventID: eventID, clientID: clientID, groupID: groupID, status: notPublished}
+					log.Print(err)
+					break
+				}
+				var dst bytes.Buffer
+				json.Compact(&dst, in.GetPayload())
+				err = sc.Publish(eventID, dst.Bytes())
+				if err != nil {
+					log.Fatalf("Error during publish: %v\n", err)
+					msgRCV <- counter{eventID: eventID, clientID: clientID, groupID: groupID, status: notPublished}
+				}
+				msgRCV <- counter{eventID: eventID, clientID: clientID, groupID: groupID, status: ok}
+				sc.Close()
 				s = pb.Status{Code: pb.Status_OK, Description: "Valid"}
 			}
 		}
+
 		c := pb.Cursor{
 			Ts: time.Now().Unix(),
 			Id: 0}
 		a := &pb.Acknowledge{Cursor: &c, Status: &s}
+		spa.End()
 		if err := stream.Send(a); err != nil {
 			log.Printf("error while sending to the client")
 			msgRCV <- counter{eventID: eventID, clientID: clientID, groupID: groupID, status: unableToAcknowledge}
@@ -352,7 +340,7 @@ func main() {
 	signal.Notify(signalChan, os.Interrupt, os.Kill)
 	go func() {
 		for _ = range signalChan {
-			fmt.Println("\nReceived an interrupt, stopping services...\n")
+			log.Info("\nReceived an interrupt, stopping services...\n")
 			s.deregister()
 			s.stopMonitoring()
 			s.grpcServer.GracefulStop()
@@ -365,23 +353,23 @@ func main() {
 
 }
 func (e *eventServer) run() {
-	// The localEndpoint stores the name and address of the local service
-	localEndpoint, err := openzipkin.NewEndpoint("example-server", "192.168.1.5:5454")
+
+	zipkinURL := "http://localhost:9411/api/v2/spans"
+
+	localEndpoint, err := openzipkin.NewEndpoint("event-grid", "1611L2204BE:8000")
 	if err != nil {
-		log.Println(err)
+		log.Fatal(err)
 	}
 
-	// The Zipkin reporter takes collected spans from the app and reports them to the backend
-	// http://localhost:9411/api/v2/spans is the default for the Zipkin Span v2
-	reporter := zhttp.NewReporter("http://localhost:9411/api/v2/spans")
-	defer reporter.Close()
-
-	// The OpenCensus exporter wraps the Zipkin reporter
+	reporter := zipkinhttp.NewReporter(zipkinURL, zipkinhttp.MaxBacklog(10000))
 	exporter := zipkin.NewExporter(reporter, localEndpoint)
 	trace.RegisterExporter(exporter)
-
-	// For example purposes, sample every trace.
 	trace.ApplyConfig(trace.Config{DefaultSampler: trace.AlwaysSample()})
+
+	log.WithFields(log.Fields{"url": zipkinURL}).Info("exporting spans to zipkin")
+
+	// TODO don't do this. testing parity.
+	trace.SetDefaultSampler(trace.AlwaysSample())
 
 	ctx := context.Background()
 	foo(ctx)
@@ -411,7 +399,7 @@ func (e *eventServer) run() {
 
 	opts = append(opts, grpc.StreamInterceptor(prom.StreamServerInterceptor))
 	opts = append(opts, grpc.UnaryInterceptor(prom.UnaryServerInterceptor))
-	//opts = append(opts, grpc.StatsHandler(&ocgrpc.ServerHandler{}))
+	opts = append(opts, grpc.StatsHandler(&ocgrpc.ServerHandler{}))
 	e.grpcServer = grpc.NewServer(opts...)
 	pb.RegisterEventsSenderServer(e.grpcServer, e)
 	reflection.Register(e.grpcServer)
@@ -454,7 +442,7 @@ func baz(ctx context.Context) {
 }
 
 func (e *eventServer) deregister() {
-	log.Println("deregistering from registry")
+	log.WithField("registry", e.serviceRegistry).Info("deregistering from registry")
 	config := consul.Config{Address: e.serviceRegistry}
 
 	// Get Service Endpoints
@@ -465,23 +453,22 @@ func (e *eventServer) deregister() {
 	agent := client.Agent()
 	err = agent.ServiceDeregister("Event-Server1")
 	if err != nil {
-		log.Print(err)
+		log.Fatal(err)
 	}
 
 }
 
 func (e *eventServer) register() {
-	log.Println("Registering service ")
+
+	log.Info("Registering service ")
 	config := consul.Config{Address: e.serviceRegistry}
 
 	// Get Service Endpoints
 	client, err := consul.NewClient(&config)
 	if err != nil {
-		log.Println("impossible to access service registry %s", e.serviceRegistry)
+		log.WithField("service registry", e.serviceRegistry).Fatal("impossible to access service registry")
 	}
 	host, _ := os.Hostname()
-	//	s := consul.AgentService{ID: "Event-Server1", Service: "Event-Server", Port: e.port, Tags: []string{"events"}}
-	//	c := consul.CatalogRegistration{Node: host, Address: host, Datacenter: "dc1", Service: &s}
 
 	//	catalog := client.Catalog()
 	agent := client.Agent()
@@ -490,16 +477,12 @@ func (e *eventServer) register() {
 	if err != nil {
 		log.Fatalf("\U0001F4A9 \t %s", err)
 	}
-	/*_, err = catalog.Register(&c, nil)
-	if err != nil {
-		log.Print(err)
-	}*/
 	log.Println("\U0001f197 \t service registered")
 }
 
 func (e *eventServer) getConfig(serviceName string) (endpoint string, err error) {
 	config := consul.Config{Address: e.serviceRegistry}
-	log.Printf("looking for %s on %s \n", serviceName, e.serviceRegistry)
+	log.WithField("serviceName", serviceName).WithField("registry", e.serviceRegistry).Info("looking for service \n", serviceName, e.serviceRegistry)
 	client, err := consul.NewClient(&config)
 	if err != nil {
 		return "", err
